@@ -1,0 +1,67 @@
+# Example SyncBit Configuration
+# This shows how to configure named providers that can be referenced by jobs
+
+# Client configuration (for CLI usage)
+client:
+  controller_addr: "http://localhost:8080"
+
+# Daemon configuration (for agent processes)
+daemon:
+  debug: true
+  agent_addr: "http://localhost:8081"
+  controller_addr: "http://localhost:8080"
+
+  # Named provider configurations
+  # These contain only authentication and connection settings
+  # Resource identifiers (repos, buckets, URLs) are specified per-job
+  providers:
+    # HuggingFace provider for public models
+    hf-public:
+      id: "hf-public"
+      type: "hf"
+      name: "HuggingFace Public"
+      # No token required for public models
+
+    # HuggingFace provider for private models (if needed)
+    hf-private:
+      id: "hf-private"
+      type: "hf"
+      name: "HuggingFace Private"
+      token: "${HF_TOKEN}"  # From environment variable
+
+# Agent configuration (for distributed caching and peer-to-peer transfer)
+agent:
+  # Unique agent identifier (auto-generated from hostname if not specified)
+  id: "test-agent-1"
+
+  # Storage configuration
+  storage:
+    # Base path where all datasets will be stored
+    # Each dataset gets its own subdirectory: {base_path}/{dataset_name}/
+    base_path: "./downloads"
+
+    # Cache configuration
+    cache:
+      # Maximum RAM usage for block cache (parsed as bytes, supports K/M/G/T suffixes)
+      ram_limit: "1GB"
+
+      # Maximum disk usage for all datasets (0 = unlimited)
+      disk_limit: "0"
+
+      # Block size for chunking files (default: 1MB)
+      block_size: "1MB"
+
+  # Network configuration for peer-to-peer communication
+  network:
+    # Address to bind the agent API server
+    listen_addr: "http://0.0.0.0:8081"
+
+    # Address that other agents should use to reach this agent
+    # If empty, will try to auto-detect from listen_addr
+    advertise_addr: "http://localhost:8081"
+
+    # Heartbeat interval for reporting to controller
+    heartbeat_interval: "10s"
+
+    # Timeout for peer-to-peer requests
+    peer_timeout: "30s"

@@ -1,22 +1,19 @@
 package agent
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
+	"syncbit/internal/api"
+	"syncbit/internal/api/request"
 	"syncbit/internal/config"
 	"syncbit/internal/core/logger"
+	"syncbit/internal/core/types"
 	"syncbit/internal/provider"
-	"syncbit/internal/runner"
-	"syncbit/internal/runner/handlers"
-
-	"gopkg.in/yaml.v3"
+	"syncbit/internal/transport"
 )
 
 // Job represents a job from the controller
@@ -38,17 +35,23 @@ type JobConfig struct {
 	LocalPath  string   `json:"local_path"`
 }
 
+// Config represents the complete configuration file structure
 type Config struct {
-	AgentURL      string `yaml:"agent_url"`
-	ControllerURL string `yaml:"controller_url"`
-	Debug         bool   `yaml:"debug"`
+	Client ClientConfig        `yaml:"client"`
+	Daemon config.DaemonConfig `yaml:"daemon"`
+	Agent  config.AgentConfig  `yaml:"agent"`
+}
+
+// ClientConfig holds configuration for the client
+type ClientConfig struct {
+	ControllerAddr types.Address `yaml:"controller_addr"`
 }
 
 type Agent struct {
 	cfg        *Config
-	daemonCfg  *config.DaemonConfig
 	log        *logger.Logger
-	httpClient *http.Client
+	httpClient *transport.HTTPTransfer
+	server     *api.Server
 }
 
 type AgentOption func(*Agent)
@@ -59,41 +62,62 @@ func WithLogger(log *logger.Logger) AgentOption {
 	}
 }
 
+func WithServer(server *api.Server) AgentOption {
+	return func(a *Agent) {
+		a.server = server
+	}
+}
+
 func NewAgent(configFile string, debug bool, opts ...AgentOption) *Agent {
-	// Load both agent and daemon configuration
+	// Load configuration with defaults
 	cfg := &Config{}
-	daemonCfg := &config.DaemonConfig{}
+	config.LoadYAMLWithDefaults(configFile, cfg)
 
-	f, err := os.Open(configFile)
-	if err == nil {
-		defer f.Close()
-		var fullConfig struct {
-			Agent  Config              `yaml:"agent"`
-			Daemon config.DaemonConfig `yaml:"daemon"`
-		}
-		if err := yaml.NewDecoder(f).Decode(&fullConfig); err == nil {
-			cfg = &fullConfig.Agent
-			daemonCfg = &fullConfig.Daemon
+	// Apply defaults for empty sections
+	if cfg.Agent.ID == "" {
+		defaultAgentCfg := config.DefaultAgentConfig()
+		cfg.Agent = defaultAgentCfg
+
+		// Generate agent ID from hostname if not specified
+		if hostname, err := os.Hostname(); err == nil {
+			cfg.Agent.ID = fmt.Sprintf("agent-%s", hostname)
+		} else {
+			cfg.Agent.ID = fmt.Sprintf("agent-%d", time.Now().Unix())
 		}
 	}
 
+	// Apply debug flag
 	if debug {
-		cfg.Debug = true
-		daemonCfg.Debug = true
+		cfg.Daemon.Debug = true
 	}
 
-	// Use daemon controller URL if agent doesn't have one
-	if cfg.ControllerURL == "" && daemonCfg.ControllerURL != "" {
-		cfg.ControllerURL = daemonCfg.ControllerURL
+	// Use daemon controller address if client doesn't have one
+	if (cfg.Client.ControllerAddr == types.Address{}) && (cfg.Daemon.ControllerAddr != types.Address{}) {
+		cfg.Client.ControllerAddr = cfg.Daemon.ControllerAddr
 	}
+
+	// Auto-detect advertise address if not set
+	if (cfg.Agent.Network.AdvertiseAddr == types.Address{}) {
+		// Use listen address but replace 0.0.0.0 with localhost
+		advertiseAddr := cfg.Agent.Network.ListenAddr
+		if advertiseAddr.Host == "0.0.0.0" {
+			advertiseAddr.Host = "localhost"
+		}
+		cfg.Agent.Network.AdvertiseAddr = advertiseAddr
+	}
+
+	// Create a simple HTTP client for agent-controller communication
+	httpClient := transport.NewHTTPTransfer(
+		transport.HTTPWithClient(&http.Client{
+			Timeout: 30 * time.Second,
+		}),
+	)
 
 	a := &Agent{
-		cfg:       cfg,
-		daemonCfg: daemonCfg,
-		log:       logger.NewLogger(logger.WithName("agent")),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		cfg:        cfg,
+		log:        logger.NewLogger(logger.WithName("agent")),
+		httpClient: httpClient,
+		server:     api.NewServer(api.WithListen(cfg.Agent.Network.ListenAddr)),
 	}
 
 	for _, opt := range opts {
@@ -104,199 +128,109 @@ func NewAgent(configFile string, debug bool, opts ...AgentOption) *Agent {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	a.log.Info("Starting agent", "controller", a.cfg.ControllerURL)
+	a.log.Info("Starting agent",
+		"controller", a.cfg.Client.ControllerAddr.URL(),
+		"agent_id", a.cfg.Agent.ID,
+		"listen", a.cfg.Agent.Network.ListenAddr.URL(),
+		"advertise", a.cfg.Agent.Network.AdvertiseAddr.URL(),
+	)
 
 	// Initialize providers from daemon config
-	if err := provider.InitFromDaemonConfig(*a.daemonCfg); err != nil {
+	if err := provider.InitFromDaemonConfig(a.cfg.Daemon); err != nil {
 		a.log.Error("Failed to initialize providers", "error", err)
 		return fmt.Errorf("failed to initialize providers: %w", err)
 	}
 	a.log.Info("Initialized providers", "providers", provider.ListProviders())
 
-	// Start job polling loop
+	// Register API handlers
+	if err := a.RegisterHandlers(a.server); err != nil {
+		return fmt.Errorf("failed to register handlers: %w", err)
+	}
+
+	// Register with controller
+	if err := a.registerWithController(ctx); err != nil {
+		a.log.Error("Failed to register with controller", "error", err)
+		return fmt.Errorf("failed to register with controller: %w", err)
+	}
+
+	// Start heartbeat goroutine
+	heartbeatInterval := a.cfg.Agent.Network.ParseHeartbeatInterval(30 * time.Second)
+	go a.heartbeatLoop(ctx, heartbeatInterval)
+
+	// Start the agent API server
+	a.log.Info("Starting agent API server", "address", a.cfg.Agent.Network.ListenAddr.URL())
+	return a.server.Run(ctx)
+}
+
+// registerWithController registers this agent with the controller
+func (a *Agent) registerWithController(ctx context.Context) error {
+	registrationRequest := struct {
+		ID            string `json:"id"`
+		AdvertiseAddr string `json:"advertise_addr"`
+	}{
+		ID:            a.cfg.Agent.ID,
+		AdvertiseAddr: a.cfg.Agent.Network.AdvertiseAddr.URL(),
+	}
+
+	url := fmt.Sprintf("%s/agents/register", a.cfg.Client.ControllerAddr.URL())
+
+	err := a.httpClient.Post(ctx, url, func(resp *http.Response) error {
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 201 {
+			return fmt.Errorf("registration failed with status: %d", resp.StatusCode)
+		}
+
+		// TODO: Parse registration response if needed
+		a.log.Info("Successfully registered with controller", "agent_id", a.cfg.Agent.ID)
+		return nil
+	}, request.WithJSON(registrationRequest))
+
+	return err
+}
+
+// heartbeatLoop sends periodic heartbeats to the controller
+func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			a.log.Info("Agent shutdown requested")
-			return nil
-		default:
-			if err := a.pollAndExecuteJob(ctx); err != nil {
-				a.log.Error("Error processing job", "error", err)
-				// Continue polling even if job execution fails
+			a.log.Debug("Heartbeat loop stopping")
+			return
+		case <-ticker.C:
+			if err := a.sendHeartbeat(ctx); err != nil {
+				a.log.Error("Failed to send heartbeat", "error", err)
+				// Continue trying - don't exit on heartbeat failures
 			}
 		}
-
-		// Brief pause before next poll to avoid overwhelming the controller
-		time.Sleep(2 * time.Second)
 	}
 }
 
-func (a *Agent) pollAndExecuteJob(ctx context.Context) error {
-	// Poll controller for next job
-	job, err := a.getNextJob(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get next job: %w", err)
+// sendHeartbeat sends current agent state to the controller
+func (a *Agent) sendHeartbeat(ctx context.Context) error {
+	// TODO: Implement proper state collection
+	// For now, send basic empty state
+	state := AgentState{
+		DiskUsed:      0,
+		DiskAvailable: 1024 * 1024 * 1024 * 1024, // 1TB placeholder
+		DataSets:      []DataSetInfo{},
+		ActiveJobs:    []string{},
 	}
 
-	if job == nil {
-		// No jobs available, this is normal
+	url := fmt.Sprintf("%s/agents/%s/heartbeat", a.cfg.Client.ControllerAddr.URL(), a.cfg.Agent.ID)
+
+	err := a.httpClient.Post(ctx, url, func(resp *http.Response) error {
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("heartbeat failed with status: %d", resp.StatusCode)
+		}
+
+		a.log.Debug("Heartbeat sent successfully")
 		return nil
-	}
+	}, request.WithJSON(state))
 
-	a.log.Info("Received job", "job_id", job.ID, "type", job.Type, "handler", job.Handler)
-
-	// Execute the job
-	if err := a.executeJob(ctx, job); err != nil {
-		a.log.Error("Job execution failed", "job_id", job.ID, "error", err)
-		// Update job status to failed
-		a.updateJobStatus(job.ID, "failed", err.Error())
-		return err
-	}
-
-	a.log.Info("Job completed successfully", "job_id", job.ID)
-	// Update job status to completed
-	a.updateJobStatus(job.ID, "completed", "")
-	return nil
-}
-
-func (a *Agent) getNextJob(ctx context.Context) (*Job, error) {
-	url := fmt.Sprintf("%s/jobs/next", a.cfg.ControllerURL)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusRequestTimeout {
-		// No jobs available - this is normal
-		return nil, nil
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	var response struct {
-		Job *Job `json:"job"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, err
-	}
-
-	return response.Job, nil
-}
-
-func (a *Agent) updateJobStatus(jobID, status, errorMsg string) {
-	statusUpdate := struct {
-		Status string `json:"status"`
-		Error  string `json:"error,omitempty"`
-	}{
-		Status: status,
-		Error:  errorMsg,
-	}
-
-	jsonData, err := json.Marshal(statusUpdate)
-	if err != nil {
-		a.log.Error("Failed to marshal status update", "error", err)
-		return
-	}
-
-	url := fmt.Sprintf("%s/jobs/%s/status", a.cfg.ControllerURL, jobID)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		a.log.Error("Failed to create status update request", "error", err)
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		a.log.Error("Failed to update job status", "error", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		a.log.Error("Failed to update job status", "status_code", resp.StatusCode)
-	}
-}
-
-func (a *Agent) executeJob(ctx context.Context, job *Job) error {
-	switch job.Handler {
-	case "hf":
-		return a.executeHFJob(ctx, job)
-	default:
-		return fmt.Errorf("unsupported job handler: %s", job.Handler)
-	}
-}
-
-func (a *Agent) executeHFJob(ctx context.Context, job *Job) error {
-	// Create a job pool for this download
-	pool := runner.NewPool(ctx, fmt.Sprintf("job-%s", job.ID))
-
-	// Create download tasks for each file
-	// Keep track of job-to-filename mapping for better error reporting
-	jobFileMap := make(map[string]string)
-
-	for _, fileName := range job.Config.Files {
-		// Create handler for this file
-		handler := handlers.NewHFDownloadHandler(
-			job.Config.LocalPath,  // localBasePath
-			"",                    // localJobPath (empty for root)
-			job.Config.ProviderID, // providerID
-			job.Config.Repo,       // repo
-			job.Config.Revision,   // revision
-			fileName,              // remotePath
-		)
-
-		// Create a runner job for this file
-		fileJobName := fmt.Sprintf("%s-%s", job.ID, filepath.Base(fileName))
-		fileJob := runner.NewJob(
-			fileJobName,
-			handler.Run,
-		)
-
-		// Map job name to original filename for error reporting
-		jobFileMap[fileJobName] = fileName
-
-		// Submit the file download job
-		if err := pool.Submit(fileJob); err != nil {
-			return fmt.Errorf("failed to submit file job for %s: %w", fileName, err)
-		}
-
-		a.log.Debug("Submitted file download job", "file", fileName, "job_id", job.ID)
-	}
-
-	// Wait for all file downloads to complete
-	completedCount := 0
-	totalFiles := len(job.Config.Files)
-
-	for completedCount < totalFiles {
-		fileJob, err := pool.Wait()
-		if err != nil {
-			return fmt.Errorf("error waiting for file download: %w", err)
-		}
-
-		completedCount++
-		if fileJob.Tracker().IsFailed() {
-			// Use original filename instead of job name for error reporting
-			originalFileName := jobFileMap[fileJob.Name()]
-			if originalFileName == "" {
-				originalFileName = fileJob.Name() // fallback to job name if mapping not found
-			}
-			return fmt.Errorf("file download failed: %s", originalFileName)
-		}
-
-		a.log.Debug("File download completed", "file_job", fileJob.Name(), "progress", fmt.Sprintf("%d/%d", completedCount, totalFiles))
-	}
-
-	a.log.Info("All files downloaded successfully", "job_id", job.ID, "files", totalFiles)
-	return nil
+	return err
 }

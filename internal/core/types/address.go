@@ -52,8 +52,13 @@ func (a Address) MarshalYAML() (any, error) {
 }
 
 func (a *Address) UnmarshalYAML(unmarshal func(any) error) error {
-	var u url.URL
-	if err := unmarshal(&u); err != nil {
+	var urlStr string
+	if err := unmarshal(&urlStr); err != nil {
+		return err
+	}
+
+	u, err := url.Parse(urlStr)
+	if err != nil {
 		return err
 	}
 
