@@ -7,15 +7,14 @@ import (
 	"os"
 	"path/filepath"
 
+	"syncbit/internal/core/types"
 	"syncbit/internal/runner"
-	"syncbit/internal/transfer"
-
-	"golang.org/x/time/rate"
+	"syncbit/internal/transport"
 )
 
 type HTTPDownloadHandlerOption func(*HTTPDownloadHandler)
 
-func HTTPDownloadHandlerWithLimiter(limiter *rate.Limiter) HTTPDownloadHandlerOption {
+func HTTPDownloadHandlerWithLimiter(limiter *types.RateLimiter) HTTPDownloadHandlerOption {
 	return func(t *HTTPDownloadHandler) {
 		t.limiter = limiter
 	}
@@ -27,7 +26,7 @@ type HTTPDownloadHandler struct {
 	localJobPath  string // local job path -> localBasePath/localJobPath
 	baseUrl       string // base url of the remote file path
 	remotePath    string // remote file path -> baseUrl/remotePath -> localBasePath/localJobPath/remotePath
-	limiter       *rate.Limiter
+	limiter       *types.RateLimiter
 }
 
 // NewHTTPDownloadHandler creates a new HTTPDownloadHandler for downloading files from a URL.
@@ -42,7 +41,7 @@ func NewHTTPDownloadHandler(
 		localJobPath:  localJobPath,
 		baseUrl:       baseUrl,
 		remotePath:    remotePath,
-		limiter:       transfer.DefaultRateLimiter(),
+		limiter:       types.DefaultRateLimiter(),
 	}
 
 	for _, opt := range opts {
@@ -73,19 +72,19 @@ func (t *HTTPDownloadHandler) Run(ctx context.Context, self *runner.Job) error {
 	}
 	defer fileHandle.Close()
 
-	ht := transfer.NewHTTPTransfer(
-		transfer.HTTPWithClient(transfer.DefaultHTTPClient()),
+	ht := transport.NewHTTPTransfer(
+		transport.HTTPWithClient(transport.DefaultHTTPClient()),
 	)
 
 	htCallback := func(resp *http.Response) error {
 		defer resp.Body.Close()
 		self.Tracker().SetTotal(resp.ContentLength)
 		self.Tracker().SetCurrent(0)
-		rw := transfer.NewReaderWriter(
-			transfer.RWWithIOWriter(fileHandle),
-			transfer.RWWithIOReader(resp.Body),
-			transfer.RWWithReadLimiter(t.limiter),
-			transfer.RWWithReaderCallback(func(n int64) {
+		rw := types.NewReaderWriter(
+			types.RWWithIOWriter(fileHandle),
+			types.RWWithIOReader(resp.Body),
+			types.RWWithReadLimiter(t.limiter),
+			types.RWWithReaderCallback(func(n int64) {
 				self.Tracker().IncCurrent(n)
 			}),
 		)

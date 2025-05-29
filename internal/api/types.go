@@ -1,4 +1,4 @@
-package server
+package api
 
 import (
 	"net/http"
@@ -27,7 +27,11 @@ func NewRoute(method, path string, handler http.HandlerFunc) Route {
 	}
 }
 
+// String returns the pattern format expected by Go 1.22+ ServeMux: "METHOD /path"
 func (r *Route) String() string {
+	if r.Method == "" {
+		return r.Path
+	}
 	return r.Method + " " + r.Path
 }
 

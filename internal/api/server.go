@@ -1,4 +1,4 @@
-package server
+package api
 
 import (
 	"context"
@@ -35,16 +35,16 @@ type Server struct {
 // NewServer creates a new HTTP server
 func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
-		logger:     logger.NewLogger(logger.WithName("server")),
-		listen:     types.NewAddress("0.0.0.0", 8080),
-		routes:     make(map[string]http.HandlerFunc),
+		logger: logger.NewLogger(logger.WithName("server")),
+		listen: types.NewAddress("0.0.0.0", 8080),
+		routes: make(map[string]http.HandlerFunc),
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
 
 	s.httpServer = &http.Server{
-		Addr:    s.listen.HostPort(),
+		Addr:    s.listen.String(),
 		Handler: http.NewServeMux(),
 	}
 
@@ -66,7 +66,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	// Start server in a goroutine so we can wait for ctx.Done
-	s.logger.Info("Starting server", "address", s.listen.HostPort())
+	s.logger.Info("Starting server", "address", s.listen.URL())
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- s.httpServer.ListenAndServe()

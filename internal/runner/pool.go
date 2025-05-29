@@ -117,7 +117,11 @@ func (p *Pool) worker(ctx context.Context) {
 		case <-p.done:
 			p.logger.Debug("pool is closed, worker exiting")
 			return
-		case job := <-p.jobs:
+		case job, ok := <-p.jobs:
+			if !ok {
+				p.logger.Debug("jobs channel closed, worker exiting")
+				return
+			}
 			p.logger.Debug("worker running job", "job", job.Name())
 			err := job.Run(ctx)
 			p.tracker.Update(err)   // Update the tracker with the result

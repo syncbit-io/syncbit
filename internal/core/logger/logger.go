@@ -129,8 +129,8 @@ func (l *Logger) With(args ...any) *slog.Logger {
 
 func (l *Logger) WithGroup(group string) *Logger {
 	return &Logger{
-		Logger: l.Logger.WithGroup(group),
-		level:  l.level,
+		Logger:  l.Logger.WithGroup(group),
+		level:   l.level,
 		handler: l.handler,
 	}
 }

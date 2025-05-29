@@ -1,8 +1,6 @@
-package transfer
+package types
 
 import (
-	"syncbit/internal/core/types"
-
 	"github.com/dustin/go-humanize"
 	"golang.org/x/time/rate"
 )
@@ -13,16 +11,20 @@ const (
 	DefaultRateBurst   = 1 * humanize.MByte // 1MB * concurrency
 )
 
-func DefaultRateLimiter() *rate.Limiter {
+type RateLimiter struct {
+	*rate.Limiter
+}
+
+func DefaultRateLimiter() *RateLimiter {
 	return NewRateLimiter(DefaultRateLimit, DefaultRateBurst, DefaultConcurrency)
 }
 
-func NewRateLimiter(rateLimit, rateBurst types.Bytes, concurrency int) *rate.Limiter {
+func NewRateLimiter(rateLimit, rateBurst Bytes, concurrency int) *RateLimiter {
 	rateInt := rateLimit.Bytes()
 
 	// If rate is 0, create an unlimited rate limiter
 	if rateInt == 0 {
-		return rate.NewLimiter(rate.Inf, 0)
+		return &RateLimiter{rate.NewLimiter(rate.Inf, 0)}
 	}
 
 	// Use rateBurst * concurrency as the burst size
@@ -36,5 +38,5 @@ func NewRateLimiter(rateLimit, rateBurst types.Bytes, concurrency int) *rate.Lim
 		burstSize = 1
 	}
 
-	return rate.NewLimiter(rate.Limit(rateInt), burstSize)
+	return &RateLimiter{rate.NewLimiter(rate.Limit(rateInt), burstSize)}
 }

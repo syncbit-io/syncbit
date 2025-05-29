@@ -12,7 +12,7 @@ const (
 
 func GetBlocks(size int64) int {
 	blocks := int(size / BlockSize)
-	if size % BlockSize != 0 {
+	if size%BlockSize != 0 {
 		blocks++
 	}
 	if blocks == 0 {

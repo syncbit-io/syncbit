@@ -1,4 +1,4 @@
-package server
+package response
 
 import (
 	"encoding/json"
@@ -15,15 +15,12 @@ type Response struct {
 
 type ResponseOption func(*Response)
 
-func NewResponse(w http.ResponseWriter) *Response {
-	return &Response{
+func Respond(w http.ResponseWriter, opts ...ResponseOption) {
+	r := &Response{
 		ResponseWriter: w,
 		status:         http.StatusOK,
 		body:           nil,
 	}
-}
-
-func (r *Response) Respond(opts ...ResponseOption) {
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -99,12 +96,16 @@ func WithJSONError(err error) ResponseOption {
 	}
 }
 
-func jsonWrapper(r *Response, v any, status int) {
-	body, err := json.Marshal(v)
-	if err != nil {
-		r.status = status
-		return
-	}
-	r.body = body
+func jsonWrapper(r *Response, v JSON, status int) {
 	r.Header().Set("Content-Type", "application/json")
+	r.status = status
+
+	// Encode to bytes instead of writing directly to avoid premature writing
+	jsonBytes, err := json.Marshal(v)
+	if err != nil {
+		r.status = http.StatusInternalServerError
+		r.body = []byte(err.Error())
+	} else {
+		r.body = jsonBytes
+	}
 }

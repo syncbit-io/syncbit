@@ -1,0 +1,60 @@
+version: "3"
+
+set: [pipefail]
+shopt: [expand_aliases, globstar, nullglob]
+
+tasks:
+  deps:
+    cmds:
+    - go mod tidy
+
+  fmt:
+    desc: "Format the code"
+    cmds:
+    - go fmt ./...
+
+  lint:
+    desc: "Lint the code"
+    cmds:
+    - go vet ./...
+    - gopls check ./...
+
+  test:
+    desc: "Test the code"
+    cmds:
+    - go test ./...
+
+  default:
+    desc: "Build syncbit"
+    deps: [deps]
+    cmds:
+    - go build -o bin/syncbit ./cmd/syncbit
+    - go build -o bin/syncbitd ./cmd/syncbitd
+    sources:
+    - "**/*.go"
+    generates:
+    - bin/syncbit
+    - bin/syncbitd
+
+  clean:
+    desc: "Clean up"
+    cmds:
+    - rm -f bin/*
+
+  cli:
+    desc: "Run syncbit cli"
+    deps: [default]
+    cmds:
+    - bin/syncbit {{.CLI_ARGS}}
+
+  agent:
+    desc: "Run syncbit agent"
+    deps: [default]
+    cmds:
+    - bin/syncbitd agent {{.CLI_ARGS}}
+
+  controller:
+    desc: "Run syncbit controller"
+    deps: [default]
+    cmds:
+    - bin/syncbitd controller {{.CLI_ARGS}}
