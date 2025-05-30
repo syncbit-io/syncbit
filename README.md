@@ -6,10 +6,10 @@ Syncbit enables reproducible and efficient distribution of large files to specif
 
 ## Features
 
-- 🚀 High-throughput file distribution across cluster nodes via peer-to-peer block transfer
+- 🚀 High-throughput file distribution across cluster nodes via peer-to-peer transfer
 - 🎯 Centralized coordination and scheduling to target specific nodes with specific datasets
-- 💾 Disk-backed block-level caching with read-through/write-through LFRU (Least-Frequently/Recently Used) eviction policy
-- 🔗 Deduplicated block storage across datasets and versions to reduce bandwidth
+- 💾 Disk-backed caching with read-through/write-through LRU (Least-Recently Used) eviction policy
+- 🔗 Deduplicated file storage across datasets and versions to reduce bandwidth
 - 🪪 Pluggable source support: HTTP(S), S3, HuggingFace, local NFS/shared storage, and others
 - 🧠 Node-local coordination daemon for transfer, cache tracking, and health reporting
 - 📦 Kubernetes-friendly design for integration with:
@@ -30,12 +30,12 @@ Syncbit enables reproducible and efficient distribution of large files to specif
 ## Architecture Overview
 
 Syncbit consists of:
-- **Syncbit Daemon (syncbit):** runs on each participating node and manages block cache, transfer, and sync state
+- **Syncbit Daemon (syncbit):** runs on each participating node and manages file cache, transfer, and sync state
 - **Central Scheduler:** assigns dataset sync tasks to eligible nodes, with awareness of node attributes and dataset metadata
 - **Source Connectors:** download handlers for external and internal sources (HTTP, S3, HuggingFace, NFS, etc.)
-- **Peer Communication Layer:** essential mechanism for sharing blocks directly between nodes
-- **Metadata Store:** stores dataset metadata and block availability
-- **Block Cache:** disk-backed block-level caching with read-through/write-through for optimal read-after-write performance, deduplication, and local access
+- **Peer Communication Layer:** essential mechanism for sharing files directly between nodes
+- **Metadata Store:** stores dataset metadata and file availability
+- **RAM Cache:** disk-backed file caching with read-through/write-through for optimal read-after-write performance, deduplication, and local access
 
 ```mermaid
 %%{ init: { 'flowchart': { 'curve': 'catmulRom' } } }%%
