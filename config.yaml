@@ -19,8 +19,8 @@ daemon:
     hf-public:
       id: "hf-public"
       type: "hf"
-      name: "HuggingFace Public"
-      # No token required for public models
+      name: "Hugging Face Public"
+      # No authentication required for public repos
 
     # HuggingFace provider for private models (if needed)
     hf-private:
@@ -28,6 +28,11 @@ daemon:
       type: "hf"
       name: "HuggingFace Private"
       token: "${HF_TOKEN}"  # From environment variable
+
+    peer-main:
+      id: "peer-main"
+      type: "peer"
+      name: "Peer-to-Peer Transfer"
 
 # Agent configuration (for distributed caching and peer-to-peer transfer)
 agent:

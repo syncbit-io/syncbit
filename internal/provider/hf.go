@@ -171,23 +171,6 @@ func (p *HFProvider) BuildDownloadURL(repo, revision, path string) string {
 	return fmt.Sprintf("%s/%s/%s/%s/%s", hfBaseURL, repo, hfResolve, revision, path)
 }
 
-// Provider interface methods - these are deprecated in favor of the more specific methods above
-
-// ListFiles - deprecated, returns error directing to use ListFilesForRepo
-func (p *HFProvider) ListFiles(ctx context.Context) ([]string, error) {
-	return nil, fmt.Errorf("ListFiles is deprecated - use ListFilesForRepo(ctx, repo) instead")
-}
-
-// GetFile - deprecated, returns error directing to use GetFileInfo
-func (p *HFProvider) GetFile(ctx context.Context, path string) (*types.FileInfo, error) {
-	return nil, fmt.Errorf("GetFile is deprecated - use GetFileInfo(ctx, repo, revision, path) instead")
-}
-
-// DownloadFile is not used in the job-based architecture
-func (p *HFProvider) DownloadFile(ctx context.Context, path string, destPath string) (*types.FileInfo, error) {
-	return nil, fmt.Errorf("DownloadFile not supported in job-based architecture - use HFDownloadHandler instead")
-}
-
 func init() {
 	RegisterProviderFactory("hf", NewHFProvider)
 }

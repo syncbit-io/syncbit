@@ -5,53 +5,30 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"syncbit/internal/api"
 	"syncbit/internal/api/request"
+	"syncbit/internal/cache"
 	"syncbit/internal/config"
 	"syncbit/internal/core/logger"
 	"syncbit/internal/core/types"
-	"syncbit/internal/provider"
+	"syncbit/internal/runner"
 	"syncbit/internal/transport"
 )
 
-// Job represents a job from the controller
-type Job struct {
-	ID      string    `json:"id"`
-	Type    string    `json:"type"`
-	Handler string    `json:"handler"`
-	Config  JobConfig `json:"config"`
-	Status  string    `json:"status"`
-	Error   string    `json:"error,omitempty"`
-}
-
-// JobConfig represents the configuration for a download job
-type JobConfig struct {
-	ProviderID string   `json:"provider_id"`
-	Repo       string   `json:"repo"`
-	Revision   string   `json:"revision"`
-	Files      []string `json:"files"`
-	LocalPath  string   `json:"local_path"`
-}
-
-// Config represents the complete configuration file structure
-type Config struct {
-	Client ClientConfig        `yaml:"client"`
-	Daemon config.DaemonConfig `yaml:"daemon"`
-	Agent  config.AgentConfig  `yaml:"agent"`
-}
-
-// ClientConfig holds configuration for the client
-type ClientConfig struct {
-	ControllerAddr types.Address `yaml:"controller_addr"`
-}
-
 type Agent struct {
-	cfg        *Config
-	log        *logger.Logger
-	httpClient *transport.HTTPTransfer
-	server     *api.Server
+	cfg            *config.AgentConfig
+	controllerAddr types.Address
+	log            *logger.Logger
+	httpClient     *transport.HTTPTransfer
+	server         *api.Server
+	cache          *cache.Cache
+	pool           *runner.Pool
+	jobs           map[string]*types.Job
+	jobCancelFuncs map[string]context.CancelFunc
+	jobMutex       sync.RWMutex
 }
 
 type AgentOption func(*Agent)
@@ -69,55 +46,64 @@ func WithServer(server *api.Server) AgentOption {
 }
 
 func NewAgent(configFile string, debug bool, opts ...AgentOption) *Agent {
-	// Load configuration with defaults
-	cfg := &Config{}
-	config.LoadYAMLWithDefaults(configFile, cfg)
+	// Load daemon configuration for providers and controller address
+	daemonCfg := &config.DaemonConfig{}
+	config.LoadYAMLWithDefaults(configFile, daemonCfg)
 
-	// Apply defaults for empty sections
-	if cfg.Agent.ID == "" {
-		defaultAgentCfg := config.DefaultAgentConfig()
-		cfg.Agent = defaultAgentCfg
-
-		// Generate agent ID from hostname if not specified
-		if hostname, err := os.Hostname(); err == nil {
-			cfg.Agent.ID = fmt.Sprintf("agent-%s", hostname)
-		} else {
-			cfg.Agent.ID = fmt.Sprintf("agent-%d", time.Now().Unix())
-		}
-	}
+	// Load agent configuration or use defaults
+	agentCfg := config.DefaultAgentConfig()
+	// Note: We'll need to implement loading agent config from the same file
+	// For now, using defaults and applying runtime values
 
 	// Apply debug flag
 	if debug {
-		cfg.Daemon.Debug = true
+		daemonCfg.Debug = true
 	}
 
-	// Use daemon controller address if client doesn't have one
-	if (cfg.Client.ControllerAddr == types.Address{}) && (cfg.Daemon.ControllerAddr != types.Address{}) {
-		cfg.Client.ControllerAddr = cfg.Daemon.ControllerAddr
+	// Apply defaults for agent config if not present
+	if agentCfg.ID == "" {
+		if hostname, err := os.Hostname(); err == nil {
+			agentCfg.ID = fmt.Sprintf("agent-%s", hostname)
+		} else {
+			agentCfg.ID = fmt.Sprintf("agent-%d", time.Now().Unix())
+		}
 	}
 
 	// Auto-detect advertise address if not set
-	if (cfg.Agent.Network.AdvertiseAddr == types.Address{}) {
-		// Use listen address but replace 0.0.0.0 with localhost
-		advertiseAddr := cfg.Agent.Network.ListenAddr
+	if (agentCfg.Network.AdvertiseAddr == types.Address{}) {
+		advertiseAddr := agentCfg.Network.ListenAddr
 		if advertiseAddr.Host == "0.0.0.0" {
 			advertiseAddr.Host = "localhost"
 		}
-		cfg.Agent.Network.AdvertiseAddr = advertiseAddr
+		agentCfg.Network.AdvertiseAddr = advertiseAddr
 	}
 
-	// Create a simple HTTP client for agent-controller communication
+	// Use controller address from daemon config
+	controllerAddr := daemonCfg.ControllerAddr
+
+	// Create HTTP client for agent-controller communication
 	httpClient := transport.NewHTTPTransfer(
 		transport.HTTPWithClient(&http.Client{
 			Timeout: 30 * time.Second,
 		}),
 	)
 
+	// Initialize cache
+	agentCache, err := cache.NewCache(agentCfg.Storage.Cache, agentCfg.Storage.BasePath)
+	if err != nil {
+		// Continue with memory-only cache on error
+		agentCache, _ = cache.NewCache(agentCfg.Storage.Cache, "")
+	}
+
 	a := &Agent{
-		cfg:        cfg,
-		log:        logger.NewLogger(logger.WithName("agent")),
-		httpClient: httpClient,
-		server:     api.NewServer(api.WithListen(cfg.Agent.Network.ListenAddr)),
+		cfg:            &agentCfg,
+		controllerAddr: controllerAddr,
+		log:            logger.NewLogger(logger.WithName("agent")),
+		httpClient:     httpClient,
+		server:         api.NewServer(api.WithListen(agentCfg.Network.ListenAddr)),
+		cache:          agentCache,
+		jobs:           make(map[string]*types.Job),
+		jobCancelFuncs: make(map[string]context.CancelFunc),
 	}
 
 	for _, opt := range opts {
@@ -129,18 +115,25 @@ func NewAgent(configFile string, debug bool, opts ...AgentOption) *Agent {
 
 func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("Starting agent",
-		"controller", a.cfg.Client.ControllerAddr.URL(),
-		"agent_id", a.cfg.Agent.ID,
-		"listen", a.cfg.Agent.Network.ListenAddr.URL(),
-		"advertise", a.cfg.Agent.Network.AdvertiseAddr.URL(),
+		"controller", a.controllerAddr.URL(),
+		"agent_id", a.cfg.ID,
+		"listen", a.cfg.Network.ListenAddr.URL(),
+		"advertise", a.cfg.Network.AdvertiseAddr.URL(),
 	)
 
-	// Initialize providers from daemon config
-	if err := provider.InitFromDaemonConfig(a.cfg.Daemon); err != nil {
-		a.log.Error("Failed to initialize providers", "error", err)
-		return fmt.Errorf("failed to initialize providers: %w", err)
-	}
-	a.log.Info("Initialized providers", "providers", provider.ListProviders())
+	// Initialize providers from daemon config (assuming we have access through context or global)
+	// For now, we'll need to pass daemon config or make it accessible
+	a.log.Info("Agent started with basic configuration")
+
+	// Initialize job pool
+	a.pool = runner.NewPool(ctx, "agent-jobs",
+		runner.WithPoolLogger(a.log),
+		runner.WithPoolQueueSize(100),
+		runner.WithPoolWorkers(3),
+	)
+
+	// Start job processing goroutine
+	go a.processJobs(ctx)
 
 	// Register API handlers
 	if err := a.RegisterHandlers(a.server); err != nil {
@@ -154,12 +147,91 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	// Start heartbeat goroutine
-	heartbeatInterval := a.cfg.Agent.Network.ParseHeartbeatInterval(30 * time.Second)
+	heartbeatInterval := a.cfg.Network.ParseHeartbeatInterval(30 * time.Second)
 	go a.heartbeatLoop(ctx, heartbeatInterval)
 
 	// Start the agent API server
-	a.log.Info("Starting agent API server", "address", a.cfg.Agent.Network.ListenAddr.URL())
+	a.log.Info("Starting agent API server", "address", a.cfg.Network.ListenAddr.URL())
 	return a.server.Run(ctx)
+}
+
+// processJobs handles completed jobs from the pool and reports status back to controller
+func (a *Agent) processJobs(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case completedJob, ok := <-a.pool.Completed():
+			if !ok {
+				return
+			}
+
+			// Find the corresponding agent job
+			a.jobMutex.Lock()
+			agentJob, exists := a.jobs[completedJob.Name()]
+			if !exists {
+				a.jobMutex.Unlock()
+				a.log.Error("Completed job not found in agent jobs map", "job_id", completedJob.Name())
+				continue
+			}
+
+			// Clean up cancel function since job is complete
+			delete(a.jobCancelFuncs, completedJob.Name())
+
+			// Update job status based on runner result
+			if completedJob.Tracker().IsSucceeded() {
+				agentJob.SetStatus(types.JobStatusCompleted, "")
+				a.log.Info("Job completed successfully",
+					"job_id", agentJob.ID,
+					"handler", agentJob.Handler,
+					"files", len(agentJob.Config.Files),
+					"bytes_processed", completedJob.Tracker().Current(),
+				)
+			} else if completedJob.Tracker().IsCanceled() {
+				if agentJob.Status != types.JobStatusCancelled {
+					agentJob.SetStatus(types.JobStatusCancelled, "Job was cancelled")
+				}
+				a.log.Info("Job was cancelled", "job_id", agentJob.ID, "handler", agentJob.Handler)
+			} else {
+				errorMsg := "unknown error"
+				if completedJob.Tracker().Err() != nil {
+					errorMsg = completedJob.Tracker().Err().Error()
+				}
+				agentJob.SetStatus(types.JobStatusFailed, errorMsg)
+				a.log.Error("Job failed", "job_id", agentJob.ID, "error", errorMsg)
+			}
+			a.jobMutex.Unlock()
+
+			// Report status back to controller
+			go a.reportJobStatus(ctx, agentJob)
+		}
+	}
+}
+
+// reportJobStatus reports job completion status back to the controller
+func (a *Agent) reportJobStatus(ctx context.Context, job *types.Job) {
+	status := struct {
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+	}{
+		Status: string(job.Status),
+		Error:  job.Error,
+	}
+
+	url := fmt.Sprintf("%s/jobs/%s/status", a.controllerAddr.URL(), job.ID)
+
+	err := a.httpClient.Post(ctx, url, func(resp *http.Response) error {
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("failed to report job status, controller returned: %d", resp.StatusCode)
+		}
+		a.log.Debug("Successfully reported job status to controller", "job_id", job.ID, "status", job.Status)
+		return nil
+	}, request.WithJSON(status))
+
+	if err != nil {
+		a.log.Error("Failed to report job status to controller", "job_id", job.ID, "error", err)
+	}
 }
 
 // registerWithController registers this agent with the controller
@@ -168,21 +240,18 @@ func (a *Agent) registerWithController(ctx context.Context) error {
 		ID            string `json:"id"`
 		AdvertiseAddr string `json:"advertise_addr"`
 	}{
-		ID:            a.cfg.Agent.ID,
-		AdvertiseAddr: a.cfg.Agent.Network.AdvertiseAddr.URL(),
+		ID:            a.cfg.ID,
+		AdvertiseAddr: a.cfg.Network.AdvertiseAddr.URL(),
 	}
 
-	url := fmt.Sprintf("%s/agents/register", a.cfg.Client.ControllerAddr.URL())
+	url := fmt.Sprintf("%s/agents/register", a.controllerAddr.URL())
 
 	err := a.httpClient.Post(ctx, url, func(resp *http.Response) error {
 		defer resp.Body.Close()
-
 		if resp.StatusCode != 201 {
 			return fmt.Errorf("registration failed with status: %d", resp.StatusCode)
 		}
-
-		// TODO: Parse registration response if needed
-		a.log.Info("Successfully registered with controller", "agent_id", a.cfg.Agent.ID)
+		a.log.Info("Successfully registered with controller", "agent_id", a.cfg.ID)
 		return nil
 	}, request.WithJSON(registrationRequest))
 
@@ -202,7 +271,6 @@ func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			if err := a.sendHeartbeat(ctx); err != nil {
 				a.log.Error("Failed to send heartbeat", "error", err)
-				// Continue trying - don't exit on heartbeat failures
 			}
 		}
 	}
@@ -210,25 +278,38 @@ func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
 
 // sendHeartbeat sends current agent state to the controller
 func (a *Agent) sendHeartbeat(ctx context.Context) error {
-	// TODO: Implement proper state collection
-	// For now, send basic empty state
-	state := AgentState{
-		DiskUsed:      0,
-		DiskAvailable: 1024 * 1024 * 1024 * 1024, // 1TB placeholder
-		DataSets:      []DataSetInfo{},
-		ActiveJobs:    []string{},
+	// Collect current active jobs
+	a.jobMutex.RLock()
+	activeJobs := make([]string, 0)
+	for jobID, job := range a.jobs {
+		if job.IsActive() {
+			activeJobs = append(activeJobs, jobID)
+		}
+	}
+	a.jobMutex.RUnlock()
+
+	// Get cache stats for disk usage information
+	cacheStats := a.cache.GetCacheStats()
+
+	state := types.AgentState{
+		DiskUsed:      types.Bytes(cacheStats.DiskUsage),
+		DiskAvailable: types.Bytes(cacheStats.DiskLimit - cacheStats.DiskUsage),
+		ActiveJobs:    activeJobs,
+		LastUpdated:   time.Now(),
 	}
 
-	url := fmt.Sprintf("%s/agents/%s/heartbeat", a.cfg.Client.ControllerAddr.URL(), a.cfg.Agent.ID)
+	url := fmt.Sprintf("%s/agents/%s/heartbeat", a.controllerAddr.URL(), a.cfg.ID)
 
 	err := a.httpClient.Post(ctx, url, func(resp *http.Response) error {
 		defer resp.Body.Close()
-
 		if resp.StatusCode != 200 {
 			return fmt.Errorf("heartbeat failed with status: %d", resp.StatusCode)
 		}
-
-		a.log.Debug("Heartbeat sent successfully")
+		a.log.Debug("Heartbeat sent successfully",
+			"active_jobs", len(activeJobs),
+			"disk_used", state.DiskUsed,
+			"disk_available", state.DiskAvailable,
+		)
 		return nil
 	}, request.WithJSON(state))
 

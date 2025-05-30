@@ -118,23 +118,6 @@ func (p *HTTPProvider) GetFileFromURL(ctx context.Context, fileURL string) (*typ
 	return fileInfo, err
 }
 
-// Provider interface methods - these are deprecated in favor of URL-specific methods
-
-// ListFiles - not implemented for HTTP provider
-func (p *HTTPProvider) ListFiles(ctx context.Context) ([]string, error) {
-	return nil, fmt.Errorf("ListFiles not implemented for HTTP provider - file discovery depends on server API")
-}
-
-// GetFile - deprecated, returns error directing to use GetFileFromURL
-func (p *HTTPProvider) GetFile(ctx context.Context, path string) (*types.FileInfo, error) {
-	return nil, fmt.Errorf("GetFile is deprecated - use GetFileFromURL(ctx, fullURL) instead")
-}
-
-// DownloadFile is not used in the job-based architecture
-func (p *HTTPProvider) DownloadFile(ctx context.Context, name string, destPath string) (*types.FileInfo, error) {
-	return nil, fmt.Errorf("DownloadFile not supported in job-based architecture - use HTTPDownloadHandler instead")
-}
-
 func init() {
 	RegisterProviderFactory("http", NewHTTPProvider)
 }

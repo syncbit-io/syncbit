@@ -3,67 +3,103 @@ package cache
 import (
 	"fmt"
 	"sync"
+	"time"
+
+	"syncbit/internal/core/types"
 )
 
+// FileEntry represents a cached file in memory
 type FileEntry struct {
-	mu     sync.RWMutex
-	path   string
-	size   int64
-	blocks map[int]*BlockEntry // block index -> block entry
+	mu        sync.RWMutex
+	Size      types.Bytes
+	Timestamp time.Time
+	Data      []byte
 }
 
-func NewFileEntry(path string, size int64) *FileEntry {
+// NewFileEntry creates a file entry with the specified size
+func NewFileEntry(fileSize types.Bytes) *FileEntry {
 	return &FileEntry{
-		path:   path,
-		size:   size,
-		blocks: make(map[int]*BlockEntry, GetBlocks(size)),
+		Size:      fileSize,
+		Timestamp: time.Now(),
+		Data:      make([]byte, fileSize),
 	}
 }
 
-func (f *FileEntry) Path() string {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.path
+// NewFileEntryWithData creates a file entry with existing data
+func NewFileEntryWithData(data []byte) *FileEntry {
+	fileData := make([]byte, len(data))
+	copy(fileData, data)
+
+	return &FileEntry{
+		Size:      types.Bytes(len(data)),
+		Timestamp: time.Now(),
+		Data:      fileData,
+	}
 }
 
-func (f *FileEntry) Size() int64 {
+// Length returns the size of the file
+func (f *FileEntry) Length() types.Bytes {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.size
+	return types.Bytes(len(f.Data))
 }
 
-func (f *FileEntry) AddBlock(index int, block *BlockEntry) {
+// Write overwrites the file data
+func (f *FileEntry) Write(data []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.blocks[index] = block
+
+	f.Data = make([]byte, len(data))
+	copy(f.Data, data)
+	f.Size = types.Bytes(len(data))
+	f.Timestamp = time.Now()
+	return nil
 }
 
-func (f *FileEntry) GetBlock(index int) (*BlockEntry, error) {
+// Read returns a copy of the file data
+func (f *FileEntry) Read() ([]byte, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	block, ok := f.blocks[index]
-	if !ok {
-		return nil, fmt.Errorf("block not found: %d", index)
-	}
-	return block, nil
+
+	result := make([]byte, len(f.Data))
+	copy(result, f.Data)
+	return result, nil
 }
 
-func (f *FileEntry) Write(index int, data []byte) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	block, ok := f.blocks[index]
-	if !ok {
-		return fmt.Errorf("block not found: %d", index)
-	}
-	return block.Write(data)
+// FileIndex represents metadata about a file's location and content
+type FileIndex struct {
+	Dataset   string      `json:"dataset"`   // Dataset name
+	FilePath  string      `json:"file_path"` // File path within dataset
+	FileKey   string      `json:"file_key"`  // File key
+	Size      types.Bytes `json:"size"`      // File size
+	Timestamp time.Time   `json:"timestamp"` // When file was created/updated
+	Complete  bool        `json:"complete"`  // Whether file is fully available
 }
 
-func (f *FileEntry) Read(index int) ([]byte, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	block, ok := f.blocks[index]
-	if !ok {
-		return nil, fmt.Errorf("block not found: %d", index)
+// NewFileIndex creates a new file index entry
+func NewFileIndex(dataset, filepath, fileKey string, size types.Bytes) *FileIndex {
+	return &FileIndex{
+		Dataset:   dataset,
+		FilePath:  filepath,
+		FileKey:   fileKey,
+		Size:      size,
+		Timestamp: time.Now(),
+		Complete:  false,
 	}
-	return block.Read()
+}
+
+// GetKey returns the storage key for this file
+func (fi *FileIndex) GetKey() string {
+	return fi.FileKey
+}
+
+// GetFileKey returns the file identifier
+func (fi *FileIndex) GetFileKey() string {
+	return fmt.Sprintf("%s/%s", fi.Dataset, fi.FilePath)
+}
+
+// MarkComplete marks this file as fully available
+func (fi *FileIndex) MarkComplete() {
+	fi.Complete = true
+	fi.Timestamp = time.Now()
 }

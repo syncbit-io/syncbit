@@ -6,47 +6,27 @@ import (
 	"sync"
 	"time"
 
+	"syncbit/internal/core/types"
+
 	"github.com/dustin/go-humanize"
 )
 
-type TrackerStatus string
+// TrackerStatus is deprecated - use types.Status instead
+type TrackerStatus = types.Status
 
+// For backward compatibility
 const (
-	StatusPending   TrackerStatus = "pending"
-	StatusRunning   TrackerStatus = "running"
-	StatusSucceeded TrackerStatus = "succeeded"
-	StatusFailed    TrackerStatus = "failed"
-	StatusCanceled  TrackerStatus = "canceled"
+	StatusPending   = types.StatusPending
+	StatusRunning   = types.StatusRunning
+	StatusSucceeded = types.StatusSucceeded
+	StatusFailed    = types.StatusFailed
+	StatusCanceled  = types.StatusCanceled
 )
-
-// type TrackerStats struct {
-// 	Total     int64
-// 	Succeeded int64
-// 	Failed    int64
-// 	Canceled  int64
-// 	Running   int64
-// 	Pending   int64
-// 	Completed int64
-// }
-
-// func (t *Tracker) updateStats() {
-// 	t.mu.Lock()
-// 	defer t.mu.Unlock()
-
-// 	t.stats.Completed = t.stats.Succeeded + t.stats.Failed + t.stats.Canceled
-// 	t.stats.Total = t.stats.Succeeded + t.stats.Failed + t.stats.Canceled + t.stats.Running + t.stats.Pending
-// }
-
-// func (t *Tracker) Stats() TrackerStats {
-// 	t.mu.RLock()
-// 	defer t.mu.RUnlock()
-// 	return t.stats
-// }
 
 type Tracker struct {
 	name      string
 	mu        sync.RWMutex
-	status    TrackerStatus
+	status    types.Status
 	startedAt time.Time
 	endedAt   time.Time
 	current   int64
@@ -57,7 +37,7 @@ type Tracker struct {
 func NewTracker(name string) *Tracker {
 	t := &Tracker{
 		name:      name,
-		status:    StatusPending,
+		status:    types.StatusPending,
 		startedAt: time.Time{},
 		endedAt:   time.Time{},
 	}
@@ -68,7 +48,7 @@ func (t *Tracker) Name() string {
 	return t.name
 }
 
-func (t *Tracker) Status() TrackerStatus {
+func (t *Tracker) Status() types.Status {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.status
@@ -96,9 +76,9 @@ func (t *Tracker) Duration() time.Duration {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	switch t.status {
-	case StatusPending:
+	case types.StatusPending:
 		return time.Since(t.startedAt)
-	case StatusRunning:
+	case types.StatusRunning:
 		return time.Since(t.startedAt)
 	default:
 		return t.endedAt.Sub(t.startedAt)
@@ -241,7 +221,7 @@ func (t *Tracker) Start() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.startedAt = time.Now()
-	t.status = StatusRunning
+	t.status = types.StatusRunning
 	t.err = nil
 }
 
@@ -252,16 +232,16 @@ func (t *Tracker) Update(err error) {
 	t.endedAt = time.Now()
 	switch err {
 	case nil:
-		t.status = StatusSucceeded
+		t.status = types.StatusSucceeded
 		t.err = nil
 	case context.Canceled:
-		t.status = StatusCanceled
+		t.status = types.StatusCanceled
 		t.err = err
 	case context.DeadlineExceeded:
-		t.status = StatusFailed
+		t.status = types.StatusFailed
 		t.err = err
 	default:
-		t.status = StatusFailed
+		t.status = types.StatusFailed
 		t.err = err
 	}
 }
@@ -272,7 +252,7 @@ func (t *Tracker) Reset() {
 	defer t.mu.Unlock()
 	t.startedAt = time.Time{}
 	t.endedAt = time.Time{}
-	t.status = StatusPending
+	t.status = types.StatusPending
 	t.err = nil
 	t.current = 0
 	t.total = 0
@@ -283,35 +263,33 @@ func (t *Tracker) Reset() {
 func (t *Tracker) IsPending() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.status == StatusPending
+	return t.status == types.StatusPending
 }
 
 func (t *Tracker) IsRunning() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.status == StatusRunning
+	return t.status == types.StatusRunning
 }
 
 func (t *Tracker) IsSucceeded() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.status == StatusSucceeded
+	return t.status == types.StatusSucceeded || t.status == types.StatusCompleted
 }
 
 func (t *Tracker) IsFailed() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.status == StatusFailed
+	return t.status == types.StatusFailed
 }
 
 func (t *Tracker) IsCanceled() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.status == StatusCanceled
+	return t.status == types.StatusCanceled || t.status == types.StatusCancelled
 }
 
 func (t *Tracker) IsCompleted() bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.status != StatusPending && t.status != StatusRunning
+	return t.Status().IsComplete()
 }

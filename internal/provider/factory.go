@@ -1,12 +1,10 @@
 package provider
 
 import (
-	"context"
 	"fmt"
 	"sync"
 
 	"syncbit/internal/config"
-	"syncbit/internal/core/types"
 )
 
 // Provider factory functions for creating new provider instances
@@ -22,9 +20,6 @@ var (
 type Provider interface {
 	GetName() string
 	GetID() string
-	ListFiles(ctx context.Context) ([]string, error)
-	GetFile(ctx context.Context, path string) (*types.FileInfo, error)
-	DownloadFile(ctx context.Context, path string, destPath string) (*types.FileInfo, error)
 }
 
 // RegisterProviderFactory registers a provider factory function by type

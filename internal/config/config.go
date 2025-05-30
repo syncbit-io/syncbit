@@ -29,9 +29,8 @@ type StorageConfig struct {
 
 // CacheConfig holds cache-specific settings
 type CacheConfig struct {
-	RAMLimit  types.Bytes `yaml:"ram_limit"`  // Maximum RAM for block cache
+	RAMLimit  types.Bytes `yaml:"ram_limit"`  // Maximum RAM for file cache
 	DiskLimit types.Bytes `yaml:"disk_limit"` // Maximum disk usage (0 = unlimited)
-	BlockSize types.Bytes `yaml:"block_size"` // Block size for chunking
 }
 
 // NetworkConfig holds network and peer communication settings
@@ -114,7 +113,6 @@ func DefaultAgentConfig() AgentConfig {
 			Cache: CacheConfig{
 				RAMLimit:  types.Bytes(4 * 1024 * 1024 * 1024), // 4GB
 				DiskLimit: types.Bytes(0),                      // Unlimited
-				BlockSize: types.Bytes(1024 * 1024),            // 1MB
 			},
 		},
 		Network: NetworkConfig{

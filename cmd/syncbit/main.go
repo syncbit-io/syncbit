@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
+
 	cli "syncbit/internal/cli"
+	"syncbit/internal/core/types"
 
 	"github.com/alecthomas/kong"
 )
@@ -15,6 +18,7 @@ type SubmitJobCmd struct {
 	Files      []string `short:"f" long:"files" help:"Files to download" required:""`
 	LocalPath  string   `short:"p" long:"local-path" help:"Local destination path" required:""`
 	ProviderID string   `short:"P" long:"provider" default:"hf-public" help:"Provider ID to use"`
+	Revision   string   `short:"r" long:"revision" default:"main" help:"Git revision/branch to download"`
 }
 
 type StatusCmd struct {
@@ -31,17 +35,72 @@ type CLI struct {
 
 func (c *ListCmd) Run(cliRoot *CLI) error {
 	client := cli.NewClient(cliRoot.ControllerURL)
-	return client.ListJobs()
+	jobs, err := client.ListJobs()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Found %d jobs:\n\n", len(jobs))
+	for _, job := range jobs {
+		fmt.Printf("Job ID: %s\n", job.ID)
+		fmt.Printf("Handler: %s\n", job.Handler)
+		fmt.Printf("Status: %s\n", job.Status)
+		fmt.Printf("Repository: %s\n", job.Config.Repo)
+		fmt.Printf("Files: %v\n", job.Config.Files)
+		fmt.Printf("Local Path: %s\n", job.Config.LocalPath)
+		if job.Error != "" {
+			fmt.Printf("Error: %s\n", job.Error)
+		}
+		fmt.Println("---")
+	}
+
+	return nil
 }
 
 func (c *SubmitJobCmd) Run(cliRoot *CLI) error {
 	client := cli.NewClient(cliRoot.ControllerURL)
-	return client.SubmitJob(c.Repo, c.Files, c.LocalPath, c.ProviderID)
+
+	config := types.JobConfig{
+		ProviderID: c.ProviderID,
+		Repo:       c.Repo,
+		Revision:   c.Revision,
+		Files:      c.Files,
+		LocalPath:  c.LocalPath,
+	}
+
+	job, err := client.SubmitJob(config, types.JobHandlerHF)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Job submitted successfully!\n")
+	fmt.Printf("Job ID: %s\n", job.ID)
+	fmt.Printf("Status: %s\n", job.Status)
+
+	return nil
 }
 
 func (c *StatusCmd) Run(cliRoot *CLI) error {
 	client := cli.NewClient(cliRoot.ControllerURL)
-	return client.GetJob(c.JobID)
+	job, err := client.GetJob(c.JobID)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Job Details:\n")
+	fmt.Printf("ID: %s\n", job.ID)
+	fmt.Printf("Handler: %s\n", job.Handler)
+	fmt.Printf("Status: %s\n", job.Status)
+	fmt.Printf("Repository: %s\n", job.Config.Repo)
+	fmt.Printf("Revision: %s\n", job.Config.Revision)
+	fmt.Printf("Provider ID: %s\n", job.Config.ProviderID)
+	fmt.Printf("Files: %v\n", job.Config.Files)
+	fmt.Printf("Local Path: %s\n", job.Config.LocalPath)
+	if job.Error != "" {
+		fmt.Printf("Error: %s\n", job.Error)
+	}
+
+	return nil
 }
 
 func main() {

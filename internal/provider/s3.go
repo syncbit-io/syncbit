@@ -2,7 +2,6 @@ package provider
 
 import (
 	"context"
-	"fmt"
 
 	"syncbit/internal/config"
 	"syncbit/internal/core/types"
@@ -101,23 +100,6 @@ func (p *S3Provider) ListFilesInBucket(ctx context.Context, bucket string) ([]st
 // GetFileFromBucket gets metadata for a specific file in the specified bucket
 func (p *S3Provider) GetFileFromBucket(ctx context.Context, bucket, path string) (*types.FileInfo, error) {
 	return p.transfer.GetFile(ctx, bucket, path)
-}
-
-// Provider interface methods - these are deprecated in favor of bucket-specific methods
-
-// ListFiles - deprecated, returns error directing to use ListFilesInBucket
-func (p *S3Provider) ListFiles(ctx context.Context) ([]string, error) {
-	return nil, fmt.Errorf("ListFiles is deprecated - use ListFilesInBucket(ctx, bucket) instead")
-}
-
-// GetFile - deprecated, returns error directing to use GetFileFromBucket
-func (p *S3Provider) GetFile(ctx context.Context, path string) (*types.FileInfo, error) {
-	return nil, fmt.Errorf("GetFile is deprecated - use GetFileFromBucket(ctx, bucket, path) instead")
-}
-
-// DownloadFile is not used in the job-based architecture
-func (p *S3Provider) DownloadFile(ctx context.Context, path string, destPath string) (*types.FileInfo, error) {
-	return nil, fmt.Errorf("DownloadFile not supported in job-based architecture - use S3DownloadHandler instead")
 }
 
 func init() {

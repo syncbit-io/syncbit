@@ -24,10 +24,10 @@ func (d *DataSet) Name() string {
 	return d.name
 }
 
-func (d *DataSet) AddFile(entry *FileEntry) {
+func (d *DataSet) AddFile(path string, entry *FileEntry) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.files[entry.Path()] = entry
+	d.files[path] = entry
 }
 
 func (d *DataSet) GetFile(path string) (*FileEntry, error) {

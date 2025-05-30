@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
 	"syncbit/internal/api"
@@ -42,7 +44,7 @@ func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleSubmitJob handles job submission from clients
 func (c *Controller) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
-	var job Job
+	var job types.Job
 	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
 		c.logger.Error("Failed to decode job", "error", err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -53,11 +55,8 @@ func (c *Controller) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	if job.ID == "" {
 		job.ID = fmt.Sprintf("job-%d", time.Now().Unix())
 	}
-	if job.Type == "" {
-		job.Type = "download"
-	}
 	if job.Handler == "" {
-		job.Handler = "hf"
+		job.Handler = types.JobHandlerHF
 	}
 	if job.Config.ProviderID == "" {
 		job.Config.ProviderID = "hf-public"
@@ -89,7 +88,7 @@ func (c *Controller) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	var payload response.JSON = make(response.JSON)
 	payload["message"] = "Job submitted successfully"
 	payload["job_id"] = job.ID
-	payload["status"] = job.Status
+	payload["status"] = string(job.Status)
 
 	response.Respond(w,
 		response.WithJSONStatus(payload, http.StatusCreated),
@@ -157,7 +156,6 @@ func (c *Controller) handleGetNextJob(w http.ResponseWriter, r *http.Request) {
 
 // handleUpdateJobStatus updates job status from agents using path parameter
 func (c *Controller) handleUpdateJobStatus(w http.ResponseWriter, r *http.Request) {
-	// Use Go 1.22+ path parameter extraction
 	jobID := r.PathValue("id")
 	if jobID == "" {
 		http.Error(w, "Job ID is required", http.StatusBadRequest)
@@ -175,7 +173,8 @@ func (c *Controller) handleUpdateJobStatus(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := c.UpdateJobStatus(jobID, statusUpdate.Status, statusUpdate.Error); err != nil {
+	status := types.Status(statusUpdate.Status)
+	if err := c.UpdateJobStatus(jobID, status, statusUpdate.Error); err != nil {
 		c.logger.Error("Failed to update job status", "error", err)
 		http.Error(w, "Failed to update job status", http.StatusInternalServerError)
 		return
@@ -183,15 +182,13 @@ func (c *Controller) handleUpdateJobStatus(w http.ResponseWriter, r *http.Reques
 
 	var payload response.JSON = make(response.JSON)
 	payload["message"] = "Job status updated successfully"
-	payload["job_id"] = jobID
-	payload["status"] = statusUpdate.Status
 
 	response.Respond(w,
 		response.WithJSON(payload),
 	)
 }
 
-// handleRegisterAgent handles agent registration
+// handleRegisterAgent registers a new agent
 func (c *Controller) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	var registrationRequest struct {
 		ID            string `json:"id"`
@@ -199,41 +196,46 @@ func (c *Controller) handleRegisterAgent(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&registrationRequest); err != nil {
-		c.logger.Error("Failed to decode agent registration", "error", err)
+		c.logger.Error("Failed to decode registration request", "error", err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
 	// Validate required fields
 	if registrationRequest.ID == "" {
-		http.Error(w, "agent id is required", http.StatusBadRequest)
+		http.Error(w, "agent ID is required", http.StatusBadRequest)
 		return
 	}
 	if registrationRequest.AdvertiseAddr == "" {
-		http.Error(w, "advertise_addr is required", http.StatusBadRequest)
+		http.Error(w, "advertise address is required", http.StatusBadRequest)
 		return
 	}
 
-	// Parse advertise address from URL string
-	var advertiseAddr types.Address
-	if err := advertiseAddr.UnmarshalYAML(func(v any) error {
-		*v.(*string) = registrationRequest.AdvertiseAddr
-		return nil
-	}); err != nil {
-		c.logger.Error("Failed to parse advertise address", "error", err, "addr", registrationRequest.AdvertiseAddr)
-		http.Error(w, "Invalid advertise address format", http.StatusBadRequest)
+	// Parse advertise address
+	advertiseAddr, err := url.Parse(registrationRequest.AdvertiseAddr)
+	if err != nil {
+		http.Error(w, "invalid advertise address", http.StatusBadRequest)
 		return
 	}
 
-	// Create agent with initial empty state
-	agent := &Agent{
-		ID:            registrationRequest.ID,
-		AdvertiseAddr: advertiseAddr,
-		State: AgentState{
+	port, err := strconv.Atoi(advertiseAddr.Port())
+	if err != nil {
+		http.Error(w, "invalid port in advertise address", http.StatusBadRequest)
+		return
+	}
+
+	agent := &types.Agent{
+		ID: registrationRequest.ID,
+		AdvertiseAddr: types.NewAddress(
+			advertiseAddr.Hostname(),
+			port,
+			types.WithScheme(types.Scheme(advertiseAddr.Scheme)),
+		),
+		State: types.AgentState{
 			DiskUsed:      0,
 			DiskAvailable: 0,
-			DataSets:      []DataSetInfo{},
 			ActiveJobs:    []string{},
+			LastUpdated:   time.Now(),
 		},
 	}
 
@@ -246,23 +248,21 @@ func (c *Controller) handleRegisterAgent(w http.ResponseWriter, r *http.Request)
 	var payload response.JSON = make(response.JSON)
 	payload["message"] = "Agent registered successfully"
 	payload["agent_id"] = agent.ID
-	payload["last_heartbeat"] = agent.LastHeartbeat
 
 	response.Respond(w,
 		response.WithJSONStatus(payload, http.StatusCreated),
 	)
 }
 
-// handleAgentHeartbeat handles agent heartbeat updates
+// handleAgentHeartbeat handles heartbeat from agents
 func (c *Controller) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
-	// Use Go 1.22+ path parameter extraction
 	agentID := r.PathValue("id")
 	if agentID == "" {
 		http.Error(w, "Agent ID is required", http.StatusBadRequest)
 		return
 	}
 
-	var state AgentState
+	var state types.AgentState
 	if err := json.NewDecoder(r.Body).Decode(&state); err != nil {
 		c.logger.Error("Failed to decode agent state", "error", err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -276,8 +276,7 @@ func (c *Controller) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request
 	}
 
 	var payload response.JSON = make(response.JSON)
-	payload["message"] = "Agent heartbeat received"
-	payload["agent_id"] = agentID
+	payload["message"] = "Heartbeat received"
 
 	response.Respond(w,
 		response.WithJSON(payload),
