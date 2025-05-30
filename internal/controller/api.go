@@ -18,6 +18,11 @@ func (c *Controller) RegisterHandlers(registrar api.HandlerRegistrar) error {
 	// Health endpoint
 	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/health", c.handleHealth))
 
+	// Stats and metrics endpoints
+	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/stats", c.handleGetStats))
+	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/cache/stats", c.handleGetCacheStats))
+	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/jobs/stats", c.handleGetJobStats))
+
 	// Job management endpoints using Go 1.22+ path parameters
 	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/jobs", c.handleListJobs))
 	registrar.RegisterHandler(api.NewRoute(api.MethodPost, "/jobs", c.handleSubmitJob))
@@ -42,7 +47,7 @@ func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// handleSubmitJob handles job submission from clients
+// handleSubmitJob handles job submission requests
 func (c *Controller) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	var job types.Job
 	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
@@ -51,48 +56,50 @@ func (c *Controller) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields
+	// Validate job
 	if job.ID == "" {
-		job.ID = fmt.Sprintf("job-%d", time.Now().Unix())
-	}
-	if job.Handler == "" {
-		job.Handler = types.JobHandlerHF
-	}
-	if job.Config.ProviderID == "" {
-		job.Config.ProviderID = "hf-public"
-	}
-	if job.Config.Revision == "" {
-		job.Config.Revision = "main"
-	}
-
-	// Basic validation
-	if job.Config.Repo == "" {
-		http.Error(w, "repo is required", http.StatusBadRequest)
-		return
-	}
-	if len(job.Config.Files) == 0 {
-		http.Error(w, "files list cannot be empty", http.StatusBadRequest)
-		return
-	}
-	if job.Config.LocalPath == "" {
-		http.Error(w, "local_path is required", http.StatusBadRequest)
+		http.Error(w, "Job ID is required", http.StatusBadRequest)
 		return
 	}
 
-	if err := c.SubmitJob(&job); err != nil {
-		c.logger.Error("Failed to submit job", "error", err)
-		http.Error(w, "Failed to submit job", http.StatusInternalServerError)
+	if job.Handler != types.JobHandlerDownload {
+		http.Error(w, "Only download handler is supported", http.StatusBadRequest)
 		return
 	}
 
-	var payload response.JSON = make(response.JSON)
-	payload["message"] = "Job submitted successfully"
-	payload["job_id"] = job.ID
-	payload["status"] = string(job.Status)
+	if job.Config.FilePath == "" {
+		http.Error(w, "File path is required", http.StatusBadRequest)
+		return
+	}
 
-	response.Respond(w,
-		response.WithJSONStatus(payload, http.StatusCreated),
+	if job.Config.ProviderSource.ProviderID == "" {
+		http.Error(w, "Provider source is required", http.StatusBadRequest)
+		return
+	}
+
+	c.logger.Info("Received job submission",
+		"job_id", job.ID,
+		"handler", job.Handler,
+		"file", job.Config.FilePath,
+		"provider", job.Config.ProviderSource.ProviderID,
 	)
+
+	// Submit job to controller
+	if err := c.SubmitJob(&job); err != nil {
+		c.logger.Error("Failed to submit job", "job_id", job.ID, "error", err)
+		http.Error(w, fmt.Sprintf("Failed to submit job: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	response := map[string]interface{}{
+		"message": "Job submitted successfully",
+		"job_id":  job.ID,
+		"status":  string(job.Status),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(response)
 }
 
 // handleListJobs returns all jobs
@@ -294,4 +301,39 @@ func (c *Controller) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	response.Respond(w,
 		response.WithJSON(payload),
 	)
+}
+
+// handleGetStats returns overall controller statistics
+func (c *Controller) handleGetStats(w http.ResponseWriter, r *http.Request) {
+	jobStats := c.scheduler.GetJobStats()
+	cacheStats := c.GetCacheStats()
+
+	var payload response.JSON = make(response.JSON)
+	payload["job_stats"] = jobStats
+	payload["cache_stats"] = cacheStats
+	payload["timestamp"] = time.Now()
+
+	response.Respond(w, response.WithJSON(payload))
+}
+
+// handleGetCacheStats returns cache statistics from controller perspective
+func (c *Controller) handleGetCacheStats(w http.ResponseWriter, r *http.Request) {
+	stats := c.GetCacheStats()
+
+	var payload response.JSON = make(response.JSON)
+	payload["cache_stats"] = stats
+	payload["timestamp"] = time.Now()
+
+	response.Respond(w, response.WithJSON(payload))
+}
+
+// handleGetJobStats returns job scheduler statistics
+func (c *Controller) handleGetJobStats(w http.ResponseWriter, r *http.Request) {
+	stats := c.scheduler.GetJobStats()
+
+	var payload response.JSON = make(response.JSON)
+	payload["job_stats"] = stats
+	payload["timestamp"] = time.Now()
+
+	response.Respond(w, response.WithJSON(payload))
 }

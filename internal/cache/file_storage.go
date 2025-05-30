@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"syncbit/internal/core/types"
@@ -25,6 +26,9 @@ type FileStorage interface {
 	FileExists(dataset, filePath string) bool
 	DeleteFile(dataset, filePath string) error
 	GetFileSize(dataset, filePath string) (types.Bytes, error)
+
+	// Scanning operations
+	ScanFiles(callback func(dataset, filePath string, fileSize types.Bytes)) error
 }
 
 // DiskFileStorage implements FileStorage for actual files on disk
@@ -217,4 +221,44 @@ func (dfs *DiskFileStorage) GetFileSize(dataset, filePath string) (types.Bytes, 
 	}
 
 	return types.Bytes(fileInfo.Size()), nil
+}
+
+// ScanFiles scans all files in the storage and calls the callback for each file
+func (dfs *DiskFileStorage) ScanFiles(callback func(dataset, filePath string, fileSize types.Bytes)) error {
+	dfs.mu.RLock()
+	defer dfs.mu.RUnlock()
+
+	err := filepath.Walk(dfs.basePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(dfs.basePath, path)
+		if err != nil {
+			return err
+		}
+
+		parts := strings.Split(relPath, string(filepath.Separator))
+		if len(parts) < 2 {
+			return nil
+		}
+
+		dataset := parts[0]
+		filePath := strings.Join(parts[1:], string(filepath.Separator))
+
+		fileSize, err := dfs.GetFileSize(dataset, filePath)
+		if err != nil {
+			return err
+		}
+
+		callback(dataset, filePath, fileSize)
+
+		return nil
+	})
+
+	return err
 }

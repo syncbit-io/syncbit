@@ -12,13 +12,20 @@ import (
 )
 
 func DefaultHTTPClient() *http.Client {
-	return &http.Client{
-		Transport: &http2.Transport{
-			AllowHTTP: true,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
+	// Create a transport with HTTP/2 support
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
 		},
+	}
+
+	// Configure HTTP/2 for both HTTP and HTTPS
+	if err := http2.ConfigureTransport(transport); err == nil {
+		// HTTP/2 configured successfully
+	}
+
+	return &http.Client{
+		Transport: transport,
 	}
 }
 

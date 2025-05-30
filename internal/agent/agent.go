@@ -14,12 +14,14 @@ import (
 	"syncbit/internal/config"
 	"syncbit/internal/core/logger"
 	"syncbit/internal/core/types"
+	"syncbit/internal/provider"
 	"syncbit/internal/runner"
 	"syncbit/internal/transport"
 )
 
 type Agent struct {
 	cfg            *config.AgentConfig
+	daemonCfg      *config.DaemonConfig
 	controllerAddr types.Address
 	log            *logger.Logger
 	httpClient     *transport.HTTPTransfer
@@ -46,27 +48,52 @@ func WithServer(server *api.Server) AgentOption {
 }
 
 func NewAgent(configFile string, debug bool, opts ...AgentOption) *Agent {
-	// Load daemon configuration for providers and controller address
-	daemonCfg := &config.DaemonConfig{}
-	config.LoadYAMLWithDefaults(configFile, daemonCfg)
-
-	// Load agent configuration or use defaults
-	agentCfg := config.DefaultAgentConfig()
-	// Note: We'll need to implement loading agent config from the same file
-	// For now, using defaults and applying runtime values
-
-	// Apply debug flag
-	if debug {
-		daemonCfg.Debug = true
+	// Create a structure to load the complete configuration file
+	type AgentConfigFile struct {
+		Daemon config.DaemonConfig `yaml:"daemon"`
+		Agent  config.AgentConfig  `yaml:"agent"`
 	}
 
-	// Apply defaults for agent config if not present
+	// Load the complete configuration file
+	configData := &AgentConfigFile{}
+	config.LoadYAMLWithDefaults(configFile, configData)
+
+	// Extract daemon and agent configs
+	daemonCfg := &configData.Daemon
+	agentCfg := configData.Agent
+
+	// Apply defaults if agent config is missing or incomplete
 	if agentCfg.ID == "" {
 		if hostname, err := os.Hostname(); err == nil {
 			agentCfg.ID = fmt.Sprintf("agent-%s", hostname)
 		} else {
 			agentCfg.ID = fmt.Sprintf("agent-%d", time.Now().Unix())
 		}
+	}
+
+	// Apply defaults for storage if not set
+	if agentCfg.Storage.BasePath == "" {
+		agentCfg.Storage.BasePath = "/var/lib/syncbit/data"
+	}
+
+	// Apply defaults for cache if not set
+	if agentCfg.Storage.Cache.RAMLimit == 0 {
+		agentCfg.Storage.Cache.RAMLimit = types.Bytes(4 * 1024 * 1024 * 1024) // 4GB
+	}
+
+	// Apply defaults for network if not set
+	if (agentCfg.Network.ListenAddr == types.Address{}) {
+		agentCfg.Network.ListenAddr = types.NewAddress("0.0.0.0", 8081)
+	}
+
+	// Apply defaults for heartbeat interval
+	if agentCfg.Network.HeartbeatInterval == "" {
+		agentCfg.Network.HeartbeatInterval = "30s"
+	}
+
+	// Apply defaults for peer timeout
+	if agentCfg.Network.PeerTimeout == "" {
+		agentCfg.Network.PeerTimeout = "30s"
 	}
 
 	// Auto-detect advertise address if not set
@@ -78,15 +105,16 @@ func NewAgent(configFile string, debug bool, opts ...AgentOption) *Agent {
 		agentCfg.Network.AdvertiseAddr = advertiseAddr
 	}
 
+	// Apply debug flag
+	if debug {
+		daemonCfg.Debug = true
+	}
+
 	// Use controller address from daemon config
 	controllerAddr := daemonCfg.ControllerAddr
 
 	// Create HTTP client for agent-controller communication
-	httpClient := transport.NewHTTPTransfer(
-		transport.HTTPWithClient(&http.Client{
-			Timeout: 30 * time.Second,
-		}),
-	)
+	httpClient := transport.NewHTTPTransfer()
 
 	// Initialize cache
 	agentCache, err := cache.NewCache(agentCfg.Storage.Cache, agentCfg.Storage.BasePath)
@@ -97,6 +125,7 @@ func NewAgent(configFile string, debug bool, opts ...AgentOption) *Agent {
 
 	a := &Agent{
 		cfg:            &agentCfg,
+		daemonCfg:      daemonCfg,
 		controllerAddr: controllerAddr,
 		log:            logger.NewLogger(logger.WithName("agent")),
 		httpClient:     httpClient,
@@ -121,9 +150,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		"advertise", a.cfg.Network.AdvertiseAddr.URL(),
 	)
 
-	// Initialize providers from daemon config (assuming we have access through context or global)
-	// For now, we'll need to pass daemon config or make it accessible
-	a.log.Info("Agent started with basic configuration")
+	// Initialize providers from daemon config
+	if err := provider.InitFromDaemonConfig(*a.daemonCfg); err != nil {
+		a.log.Error("Failed to initialize providers", "error", err)
+		return fmt.Errorf("failed to initialize providers: %w", err)
+	}
+	a.log.Info("Providers initialized successfully", "count", len(provider.ListProviders()))
 
 	// Initialize job pool
 	a.pool = runner.NewPool(ctx, "agent-jobs",
@@ -180,16 +212,16 @@ func (a *Agent) processJobs(ctx context.Context) {
 
 			// Update job status based on runner result
 			if completedJob.Tracker().IsSucceeded() {
-				agentJob.SetStatus(types.JobStatusCompleted, "")
+				agentJob.SetStatus(types.StatusCompleted, "")
 				a.log.Info("Job completed successfully",
 					"job_id", agentJob.ID,
 					"handler", agentJob.Handler,
-					"files", len(agentJob.Config.Files),
+					"file", agentJob.Config.FilePath,
 					"bytes_processed", completedJob.Tracker().Current(),
 				)
 			} else if completedJob.Tracker().IsCanceled() {
-				if agentJob.Status != types.JobStatusCancelled {
-					agentJob.SetStatus(types.JobStatusCancelled, "Job was cancelled")
+				if agentJob.Status != types.StatusCancelled {
+					agentJob.SetStatus(types.StatusCancelled, "Job was cancelled")
 				}
 				a.log.Info("Job was cancelled", "job_id", agentJob.ID, "handler", agentJob.Handler)
 			} else {
@@ -197,7 +229,7 @@ func (a *Agent) processJobs(ctx context.Context) {
 				if completedJob.Tracker().Err() != nil {
 					errorMsg = completedJob.Tracker().Err().Error()
 				}
-				agentJob.SetStatus(types.JobStatusFailed, errorMsg)
+				agentJob.SetStatus(types.StatusFailed, errorMsg)
 				a.log.Error("Job failed", "job_id", agentJob.ID, "error", errorMsg)
 			}
 			a.jobMutex.Unlock()

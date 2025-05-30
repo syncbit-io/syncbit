@@ -1,8 +1,13 @@
 package cache
 
 import (
+	"context"
+	"io"
 	"os"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"syncbit/internal/config"
 	"syncbit/internal/core/types"
@@ -204,4 +209,134 @@ func (r *testReader) Read(p []byte) (int, error) {
 	n := copy(p, r.data[r.pos:])
 	r.pos += n
 	return n, nil
+}
+
+func TestCacheReadThroughWriteThrough(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := config.CacheConfig{
+		RAMLimit:  1024 * 1024,      // 1MB
+		DiskLimit: 10 * 1024 * 1024, // 10MB
+	}
+
+	cache, err := NewCache(cfg, tempDir)
+	require.NoError(t, err)
+
+	dataset := "test-dataset"
+	filepath := "test-file.bin"
+	testData := []byte("Hello, this is test data for read-through and write-through testing!")
+	fileSize := types.Bytes(len(testData))
+
+	// Test 1: Write-through behavior
+	t.Run("write-through", func(t *testing.T) {
+		// Create a cache writer ReaderWriter
+		rw := cache.NewCacheWriter(dataset, filepath, fileSize)
+
+		// Write data through the ReaderWriter
+		writer := rw.Writer(context.Background())
+		n, err := writer.Write(testData)
+		require.NoError(t, err)
+		require.Equal(t, len(testData), n)
+
+		// Close to trigger write-through
+		err = rw.CloseWriter()
+		require.NoError(t, err)
+
+		// Verify file exists in cache
+		assert.True(t, cache.HasFileByPath(dataset, filepath))
+
+		// Verify file was written to disk
+		diskData, err := cache.fileStorage.ReadFile(dataset, filepath)
+		require.NoError(t, err)
+		assert.Equal(t, testData, diskData)
+	})
+
+	// Test 2: Clear RAM cache to test read-through
+	t.Run("clear-ram-for-read-through", func(t *testing.T) {
+		// Clear the RAM cache but keep disk files
+		cache.fileCache = make(map[string]*FileEntry)
+		cache.ramUsage = 0
+		cache.lruCache = NewLRUCache(cfg.RAMLimit)
+
+		// File should still be tracked in file index
+		assert.True(t, cache.HasFileByPath(dataset, filepath))
+	})
+
+	// Test 3: Read-through behavior
+	t.Run("read-through", func(t *testing.T) {
+		// Create a cache reader ReaderWriter
+		rw := cache.NewCacheReader(dataset, filepath, fileSize)
+
+		// Read data through the ReaderWriter
+		reader := rw.Reader(context.Background())
+		readData := make([]byte, len(testData))
+		n, err := reader.Read(readData)
+		require.NoError(t, err)
+		require.Equal(t, len(testData), n)
+
+		// Verify data is correct
+		assert.Equal(t, testData, readData)
+
+		// Verify file was loaded back into RAM cache
+		fileKey := GetFileKey(dataset, filepath)
+		_, exists := cache.fileCache[fileKey]
+		assert.True(t, exists, "File should be loaded back into RAM cache after read-through")
+	})
+
+	// Test 4: Full round-trip with rate limiting and progress tracking
+	t.Run("full-integration-with-middleware", func(t *testing.T) {
+		newFilepath := "integration-test.bin"
+		largerData := make([]byte, 1024)
+		for i := range largerData {
+			largerData[i] = byte(i % 256)
+		}
+
+		var progressBytes int64
+		progressCallback := func(n int64) {
+			progressBytes += n
+		}
+
+		// Create rate limiter (generous for testing)
+		limiter := types.NewRateLimiter(types.Bytes(1024*1024), types.Bytes(1024*1024), 1) // 1MB/s
+
+		// Test write with progress and rate limiting
+		writeRW := cache.NewCacheWriter(dataset, newFilepath, types.Bytes(len(largerData)),
+			types.RWWithWriteLimiter(limiter),
+			types.RWWithWriterCallback(progressCallback),
+		)
+
+		writer := writeRW.Writer(context.Background())
+		n, err := writer.Write(largerData)
+		require.NoError(t, err)
+		require.Equal(t, len(largerData), n)
+
+		err = writeRW.CloseWriter()
+		require.NoError(t, err)
+
+		// Verify progress was tracked
+		assert.Equal(t, int64(len(largerData)), progressBytes)
+
+		// Clear RAM again
+		cache.fileCache = make(map[string]*FileEntry)
+		cache.ramUsage = 0
+		cache.lruCache = NewLRUCache(cfg.RAMLimit)
+
+		// Test read with rate limiting
+		progressBytes = 0 // Reset counter
+		readRW := cache.NewCacheReader(dataset, newFilepath, types.Bytes(len(largerData)),
+			types.RWWithReadLimiter(limiter),
+			types.RWWithReaderCallback(progressCallback),
+		)
+
+		reader := readRW.Reader(context.Background())
+		readData := make([]byte, len(largerData))
+		totalRead, err := io.ReadFull(reader, readData)
+		require.NoError(t, err)
+		require.Equal(t, len(largerData), totalRead)
+
+		// Verify data integrity
+		assert.Equal(t, largerData, readData)
+
+		// Verify progress was tracked
+		assert.Equal(t, int64(len(largerData)), progressBytes)
+	})
 }

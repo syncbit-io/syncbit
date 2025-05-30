@@ -7,13 +7,14 @@ import (
 	"io"
 	"net/http"
 
+	"syncbit/internal/api/request"
 	"syncbit/internal/config"
 	"syncbit/internal/core/types"
 	"syncbit/internal/transport"
 )
 
 // PeerProvider implements the Provider interface for peer-to-peer transfers
-// Provides communication services for transferring blocks and files between agents
+// It's essentially a simplified HTTP provider for communicating with other agents
 type PeerProvider struct {
 	id           string
 	cfg          *config.ProviderConfig
@@ -77,82 +78,26 @@ func (p *PeerProvider) GetHeaders() map[string]string {
 // GetFileFromPeer retrieves a complete file from a peer agent
 func (p *PeerProvider) GetFileFromPeer(ctx context.Context, peerAddr types.Address, dataset, filepath string) ([]byte, error) {
 	url := fmt.Sprintf("%s/datasets/%s/files/%s", peerAddr.URL(), dataset, filepath)
-
-	var fileData []byte
-	callback := func(resp *http.Response) error {
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("peer returned status %d", resp.StatusCode)
-		}
-
-		var err error
-		fileData, err = io.ReadAll(resp.Body)
-		return err
-	}
-
-	// Add peer auth headers if configured
-	reqOpts := []transport.HTTPRequestOption{}
-	if len(p.headers) > 0 {
-		reqOpts = append(reqOpts, transport.HTTPRequestHeaders(p.headers))
-	}
-
-	err := p.httpTransfer.Get(ctx, url, callback, reqOpts...)
-	return fileData, err
-}
-
-// CheckBlockFromPeer checks if a peer has a specific block (HEAD request)
-func (p *PeerProvider) CheckBlockFromPeer(ctx context.Context, peerAddr types.Address, blockHash string) (bool, error) {
-	url := fmt.Sprintf("%s/blocks/%s", peerAddr.URL(), blockHash)
-
-	var exists bool
-	callback := func(resp *http.Response) error {
-		defer resp.Body.Close()
-		exists = resp.StatusCode == http.StatusOK
-		return nil
-	}
-
-	// Add peer auth headers if configured
-	reqOpts := []transport.HTTPRequestOption{}
-	if len(p.headers) > 0 {
-		reqOpts = append(reqOpts, transport.HTTPRequestHeaders(p.headers))
-	}
-
-	err := p.httpTransfer.Head(ctx, url, callback, reqOpts...)
-	return exists, err
+	return p.httpGet(ctx, url)
 }
 
 // GetFileInfoFromPeer retrieves metadata for a file from a peer agent
 func (p *PeerProvider) GetFileInfoFromPeer(ctx context.Context, peerAddr types.Address, dataset, filepath string) (*types.FileInfo, error) {
-	url := fmt.Sprintf("%s/datasets/%s/files/%s", peerAddr.URL(), dataset, filepath)
+	url := fmt.Sprintf("%s/datasets/%s/files/%s/info", peerAddr.URL(), dataset, filepath)
 
-	var fileInfo *types.FileInfo
-	callback := func(resp *http.Response) error {
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("peer returned status %d", resp.StatusCode)
-		}
-
-		var response struct {
-			File *types.FileInfo `json:"file"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			return fmt.Errorf("failed to decode response: %w", err)
-		}
-
-		fileInfo = response.File
-		return nil
+	data, err := p.httpGet(ctx, url)
+	if err != nil {
+		return nil, err
 	}
 
-	// Add peer auth headers if configured
-	reqOpts := []transport.HTTPRequestOption{}
-	if len(p.headers) > 0 {
-		reqOpts = append(reqOpts, transport.HTTPRequestHeaders(p.headers))
+	var response struct {
+		File *types.FileInfo `json:"file"`
+	}
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	err := p.httpTransfer.Get(ctx, url, callback, reqOpts...)
-	return fileInfo, err
+	return response.File, nil
 }
 
 // GetFileAvailabilityFromPeer checks if a peer has a complete file
@@ -160,27 +105,12 @@ func (p *PeerProvider) GetFileAvailabilityFromPeer(ctx context.Context, peerAddr
 	url := fmt.Sprintf("%s/datasets/%s/files/%s/info", peerAddr.URL(), dataset, filepath)
 
 	var hasFile bool
-	callback := func(resp *http.Response) error {
+	err := p.httpTransfer.Get(ctx, url, func(resp *http.Response) error {
 		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK {
-			hasFile = true
-		} else if resp.StatusCode == http.StatusNotFound {
-			hasFile = false
-		} else {
-			return fmt.Errorf("peer returned status %d", resp.StatusCode)
-		}
-
+		hasFile = resp.StatusCode == http.StatusOK
 		return nil
-	}
+	}, p.getRequestOptions()...)
 
-	// Add peer auth headers if configured
-	reqOpts := []transport.HTTPRequestOption{}
-	if len(p.headers) > 0 {
-		reqOpts = append(reqOpts, transport.HTTPRequestHeaders(p.headers))
-	}
-
-	err := p.httpTransfer.Get(ctx, url, callback, reqOpts...)
 	return hasFile, err
 }
 
@@ -188,38 +118,51 @@ func (p *PeerProvider) GetFileAvailabilityFromPeer(ctx context.Context, peerAddr
 func (p *PeerProvider) ListDatasetsFromPeer(ctx context.Context, peerAddr types.Address) ([]string, error) {
 	url := fmt.Sprintf("%s/datasets", peerAddr.URL())
 
-	var datasets []string
-	callback := func(resp *http.Response) error {
+	data, err := p.httpGet(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+
+	var response struct {
+		Datasets []struct {
+			Name string `json:"name"`
+		} `json:"datasets"`
+	}
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	datasets := make([]string, len(response.Datasets))
+	for i, ds := range response.Datasets {
+		datasets[i] = ds.Name
+	}
+	return datasets, nil
+}
+
+// httpGet is a helper for simple GET requests that return data
+func (p *PeerProvider) httpGet(ctx context.Context, url string) ([]byte, error) {
+	var data []byte
+	err := p.httpTransfer.Get(ctx, url, func(resp *http.Response) error {
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("peer returned status %d", resp.StatusCode)
 		}
 
-		var response struct {
-			Datasets []struct {
-				Name string `json:"name"`
-			} `json:"datasets"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-			return fmt.Errorf("failed to decode response: %w", err)
-		}
+		var err error
+		data, err = io.ReadAll(resp.Body)
+		return err
+	}, p.getRequestOptions()...)
 
-		datasets = make([]string, len(response.Datasets))
-		for i, ds := range response.Datasets {
-			datasets[i] = ds.Name
-		}
-		return nil
-	}
+	return data, err
+}
 
-	// Add peer auth headers if configured
-	reqOpts := []transport.HTTPRequestOption{}
+// getRequestOptions returns the HTTP request options for peer communication
+func (p *PeerProvider) getRequestOptions() []transport.HTTPRequestOption {
 	if len(p.headers) > 0 {
-		reqOpts = append(reqOpts, transport.HTTPRequestHeaders(p.headers))
+		return []transport.HTTPRequestOption{request.WithHeaders(p.headers)}
 	}
-
-	err := p.httpTransfer.Get(ctx, url, callback, reqOpts...)
-	return datasets, err
+	return nil
 }
 
 func init() {

@@ -1,19 +1,19 @@
 package controller
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
 	"time"
 
+	"syncbit/internal/api/request"
 	"syncbit/internal/core/logger"
 	"syncbit/internal/core/types"
+	"syncbit/internal/transport"
 )
 
-// JobScheduler handles intelligent job assignment and coordination
+// JobScheduler handles job assignment and coordination
 type JobScheduler struct {
 	controller *Controller
 	logger     *logger.Logger
@@ -27,63 +27,107 @@ func NewJobScheduler(controller *Controller) *JobScheduler {
 	}
 }
 
-// ScheduleJob intelligently schedules a download job to the best available agent
-func (js *JobScheduler) ScheduleJob(ctx context.Context, job *types.Job) error {
-	js.logger.Info("Scheduling job", "job_id", job.ID, "repo", job.Config.Repo, "files", len(job.Config.Files))
+// ScheduleDownload schedules download jobs for a dataset with multiple files
+// This creates a download request that will be handled by the reconciliation loop
+func (js *JobScheduler) ScheduleDownload(ctx context.Context, repo, revision string, files []string, providerID, localPath string) ([]*types.Job, error) {
+	js.logger.Info("Scheduling download", "repo", repo, "revision", revision, "files", len(files), "provider", providerID)
 
-	// 1. Check for duplicate downloads
-	if err := js.checkForDuplicateDownloads(job); err != nil {
-		return fmt.Errorf("duplicate download check failed: %w", err)
+	var createdJobs []*types.Job
+
+	// Create one job per file to represent the desired state
+	for _, filePath := range files {
+		// Create job to represent desired state (will be managed by reconciliation)
+		job := js.createDesiredStateJob(repo, revision, filePath, localPath, providerID, types.DefaultDistributionRequest())
+		if job != nil {
+			createdJobs = append(createdJobs, job)
+		}
 	}
 
-	// 2. Find the best agent for this job
+	js.logger.Info("Download scheduling completed", "total_jobs", len(createdJobs), "requested_files", len(files))
+	return createdJobs, nil
+}
+
+// ScheduleDistributedDownload schedules downloads with specific distribution requirements
+func (js *JobScheduler) ScheduleDistributedDownload(ctx context.Context, repo, revision string, files []string, providerID, localPath string, distribution types.DistributionRequest) ([]*types.Job, error) {
+	js.logger.Info("Scheduling distributed download", "repo", repo, "files", len(files), "distribution", distribution.Strategy)
+
+	var createdJobs []*types.Job
+
+	for _, filePath := range files {
+		// Create job to represent desired state with specific distribution
+		job := js.createDesiredStateJob(repo, revision, filePath, localPath, providerID, distribution)
+		if job != nil {
+			createdJobs = append(createdJobs, job)
+		}
+	}
+
+	js.logger.Info("Distributed download scheduling completed", "total_jobs", len(createdJobs), "distribution", distribution.Strategy)
+	return createdJobs, nil
+}
+
+// createDesiredStateJob creates a job that represents the desired state for a file
+// The reconciliation loop will handle the actual job creation and distribution
+func (js *JobScheduler) createDesiredStateJob(repo, revision, filePath, localPath, providerID string, distribution types.DistributionRequest) *types.Job {
+	// Create a "desired state" job with upstream provider
+	// The reconciliation loop will create actual execution jobs
+	providerSource := types.ProviderSource{
+		ProviderID: providerID,
+	}
+
+	jobConfig := types.JobConfig{
+		Repo:           repo,
+		Revision:       revision,
+		FilePath:       filePath,
+		LocalPath:      localPath,
+		ProviderSource: providerSource,
+		Distribution:   distribution,
+	}
+
+	// Generate job ID
+	jobID := fmt.Sprintf("desired-%s-%s-%s-%d", repo, revision, filePath, time.Now().Unix())
+
+	// Create job (this represents desired state, not immediate execution)
+	job := types.NewJob(jobID, types.JobHandlerDownload, jobConfig)
+
+	// Store job
+	js.controller.jobMutex.Lock()
+	js.controller.jobs[job.ID] = job
+	js.controller.jobMutex.Unlock()
+
+	js.logger.Info("Created desired state job",
+		"job_id", job.ID,
+		"file", filePath,
+		"distribution", distribution.Strategy)
+
+	return job
+}
+
+// ScheduleJob schedules a single job (for direct execution)
+func (js *JobScheduler) ScheduleJob(ctx context.Context, job *types.Job) error {
+	js.logger.Info("Scheduling single job", "job_id", job.ID, "file", job.Config.FilePath)
+
+	// Validate job configuration
+	if job.Config.FilePath == "" {
+		return fmt.Errorf("job configuration is invalid: no file path specified")
+	}
+
+	if job.Config.ProviderSource.ProviderID == "" {
+		return fmt.Errorf("job configuration is invalid: no provider source specified")
+	}
+
+	// Ensure distribution is set for backward compatibility
+	if job.Config.Distribution.Strategy == "" {
+		job.Config.Distribution = types.DefaultDistributionRequest()
+	}
+
+	// Find the best agent for this job
 	targetAgent, err := js.selectBestAgent(job)
 	if err != nil {
 		return fmt.Errorf("failed to select agent: %w", err)
 	}
 
-	// 3. Assign the job to the selected agent
-	return js.assignJobToAgent(job, targetAgent)
-}
-
-// checkForDuplicateDownloads ensures we don't download the same file multiple times
-func (js *JobScheduler) checkForDuplicateDownloads(job *types.Job) error {
-	js.controller.jobMutex.RLock()
-	defer js.controller.jobMutex.RUnlock()
-
-	for _, existingJob := range js.controller.jobs {
-		// Skip completed or failed jobs
-		if existingJob.IsComplete() {
-			continue
-		}
-
-		// Check if same repo is being downloaded
-		if existingJob.Config.Repo == job.Config.Repo && existingJob.Config.Revision == job.Config.Revision {
-			// Check for overlapping files
-			existingFiles := make(map[string]bool)
-			for _, file := range existingJob.Config.Files {
-				existingFiles[file] = true
-			}
-
-			for _, file := range job.Config.Files {
-				if existingFiles[file] {
-					return fmt.Errorf("file %s from repo %s is already being downloaded by job %s",
-						file, job.Config.Repo, existingJob.ID)
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// AgentScore represents an agent's suitability for a job
-type AgentScore struct {
-	Agent     *types.Agent
-	Score     float64
-	DiskSpace types.Bytes
-	Load      int
-	LastSeen  time.Duration
+	// Assign the job to the selected agent
+	return js.AssignJobToAgent(job, targetAgent)
 }
 
 // selectBestAgent chooses the optimal agent for a download job
@@ -132,6 +176,15 @@ func (js *JobScheduler) selectBestAgent(job *types.Job) (*types.Agent, error) {
 	return best.Agent, nil
 }
 
+// AgentScore represents an agent's suitability for a job
+type AgentScore struct {
+	Agent     *types.Agent
+	Score     float64
+	DiskSpace types.Bytes
+	Load      int
+	LastSeen  time.Duration
+}
+
 // calculateAgentScore computes a score for how suitable an agent is for a job
 func (js *JobScheduler) calculateAgentScore(agent *types.Agent, job *types.Job, lastSeen time.Duration) AgentScore {
 	score := AgentScore{
@@ -168,8 +221,8 @@ func (js *JobScheduler) calculateAgentScore(agent *types.Agent, job *types.Job, 
 	return score
 }
 
-// assignJobToAgent assigns a job to a specific agent
-func (js *JobScheduler) assignJobToAgent(job *types.Job, agent *types.Agent) error {
+// AssignJobToAgent assigns a job to a specific agent
+func (js *JobScheduler) AssignJobToAgent(job *types.Job, agent *types.Agent) error {
 	// Send the job to the agent via HTTP
 	agentURL := fmt.Sprintf("%s/jobs", agent.AdvertiseAddr.URL())
 
@@ -195,24 +248,24 @@ func (js *JobScheduler) sendJobToAgent(ctx context.Context, agentURL string, job
 		Config:  job.Config,
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	// Use transport HTTP client
+	httpTransfer := transport.NewHTTPTransfer()
 
-	jsonData, err := json.Marshal(agentJob)
-	if err != nil {
-		return fmt.Errorf("failed to marshal job: %w", err)
-	}
+	err := httpTransfer.Post(ctx, agentURL, func(resp *http.Response) error {
+		defer resp.Body.Close()
 
-	resp, err := httpClient.Post(agentURL, "application/json", bytes.NewBuffer(jsonData))
+		if resp.StatusCode != http.StatusAccepted {
+			return fmt.Errorf("agent rejected job with status: %d", resp.StatusCode)
+		}
+
+		js.logger.Debug("Job successfully sent to agent", "job_id", agentJob.ID, "agent_url", agentURL)
+		return nil
+	}, request.WithJSON(agentJob))
+
 	if err != nil {
 		return fmt.Errorf("failed to send HTTP request: %w", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("agent rejected job with status: %d", resp.StatusCode)
-	}
-
-	js.logger.Debug("Job successfully sent to agent", "job_id", agentJob.ID, "agent_url", agentURL)
 	return nil
 }
 
@@ -226,13 +279,13 @@ func (js *JobScheduler) GetJobStats() JobSchedulerStats {
 	for _, job := range js.controller.jobs {
 		stats.TotalJobs++
 		switch job.Status {
-		case types.JobStatusPending:
+		case types.StatusPending:
 			stats.PendingJobs++
-		case types.JobStatusRunning:
+		case types.StatusRunning:
 			stats.RunningJobs++
-		case types.JobStatusCompleted:
+		case types.StatusCompleted:
 			stats.CompletedJobs++
-		case types.JobStatusFailed:
+		case types.StatusFailed:
 			stats.FailedJobs++
 		}
 	}

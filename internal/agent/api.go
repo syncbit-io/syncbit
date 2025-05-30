@@ -10,11 +10,15 @@ import (
 
 	"syncbit/internal/api"
 	"syncbit/internal/api/response"
-	"syncbit/internal/core/tracker"
 	"syncbit/internal/core/types"
 	"syncbit/internal/provider"
 	"syncbit/internal/runner"
 	"syncbit/internal/transport"
+)
+
+const (
+	// Version represents the current agent version
+	Version = "0.1.0"
 )
 
 // RegisterHandlers registers the handlers for the agent.
@@ -23,13 +27,15 @@ func (a *Agent) RegisterHandlers(registrar api.HandlerRegistrar) error {
 		api.NewRoute(api.MethodGet, "/health", a.handleHealth),
 		api.NewRoute(api.MethodGet, "/state", a.handleGetState),
 		api.NewRoute(api.MethodGet, "/info", a.handleGetInfo),
+		api.NewRoute(api.MethodGet, "/cache/stats", a.handleGetCacheStats),
+		api.NewRoute(api.MethodGet, "/files/availability", a.handleGetFileAvailability),
 		api.NewRoute(api.MethodPost, "/jobs", a.handleSubmitJob),
 		api.NewRoute(api.MethodGet, "/jobs/{id}", a.handleGetJob),
 		api.NewRoute(api.MethodDelete, "/jobs/{id}", a.handleCancelJob),
 		api.NewRoute(api.MethodGet, "/datasets", a.handleListDatasets),
 		api.NewRoute(api.MethodGet, "/datasets/{name}/files", a.handleListFiles),
-		api.NewRoute(api.MethodGet, "/datasets/{name}/files/{path...}", a.handleGetFile),
-		api.NewRoute(api.MethodGet, "/datasets/{name}/files/{path...}/info", a.handleGetFileInfo),
+		api.NewRoute(api.MethodGet, "/datasets/{name}/file-content/{path...}", a.handleGetFile),
+		api.NewRoute(api.MethodGet, "/datasets/{name}/file-info/{path...}", a.handleGetFileInfo),
 	}
 
 	for _, route := range routes {
@@ -81,9 +87,19 @@ func (a *Agent) handleGetState(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	var payload response.JSON = make(response.JSON)
 	payload["agent_id"] = a.cfg.ID
-	payload["version"] = "dev" // TODO: Add version info
+	payload["version"] = Version
 	payload["listen_addr"] = a.cfg.Network.ListenAddr.URL()
 	payload["advertise_addr"] = a.cfg.Network.AdvertiseAddr.URL()
+
+	response.Respond(w, response.WithJSON(payload))
+}
+
+// handleGetCacheStats returns cache statistics
+func (a *Agent) handleGetCacheStats(w http.ResponseWriter, r *http.Request) {
+	stats := a.cache.GetCacheStats()
+
+	var payload response.JSON = make(response.JSON)
+	payload["cache_stats"] = stats
 
 	response.Respond(w, response.WithJSON(payload))
 }
@@ -110,24 +126,23 @@ func (a *Agent) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if job.Config.ProviderID == "" && job.Handler != types.JobHandlerP2P {
-		a.log.Error("Job missing provider ID", "job_id", job.ID, "handler", job.Handler)
-		http.Error(w, "Provider ID is required for non-P2P jobs", http.StatusBadRequest)
+	if job.Config.FilePath == "" {
+		a.log.Error("Job has no file to download", "job_id", job.ID)
+		http.Error(w, "File path must be specified", http.StatusBadRequest)
 		return
 	}
 
-	if len(job.Config.Files) == 0 {
-		a.log.Error("Job has no files to download", "job_id", job.ID)
-		http.Error(w, "At least one file must be specified", http.StatusBadRequest)
+	if job.Config.ProviderSource.ProviderID == "" {
+		a.log.Error("Job missing provider source", "job_id", job.ID, "handler", job.Handler)
+		http.Error(w, "Job must specify a provider source", http.StatusBadRequest)
 		return
 	}
 
 	a.log.Info("Received job from controller",
 		"job_id", job.ID,
 		"handler", job.Handler,
-		"provider", job.Config.ProviderID,
-		"repo", job.Config.Repo,
-		"files_count", len(job.Config.Files),
+		"file", job.Config.FilePath,
+		"provider", job.Config.ProviderSource.ProviderID,
 	)
 
 	// Check if job already exists
@@ -146,7 +161,7 @@ func (a *Agent) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Initialize job status
-	job.SetStatus(types.JobStatusPending, "")
+	job.SetStatus(types.StatusPending, "")
 
 	// Store the job in our jobs map
 	a.jobs[job.ID] = &job
@@ -155,19 +170,11 @@ func (a *Agent) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	// Create a runner job based on the job type and handler
 	var runnerJob *runner.Job
 	switch job.Handler {
-	case types.JobHandlerHF:
-		runnerJob = a.createHFDownloadJob(&job)
-	case types.JobHandlerP2P:
-		runnerJob = a.createP2PDownloadJob(&job)
+	case types.JobHandlerDownload:
+		runnerJob = a.createDownloadJob(&job)
 	default:
-		a.log.Error("Unsupported job handler", "handler", job.Handler, "job_id", job.ID)
-
-		a.jobMutex.Lock()
-		job.SetStatus(types.JobStatusFailed, fmt.Sprintf("unsupported handler: %s", job.Handler))
-		a.jobMutex.Unlock()
-
-		http.Error(w, "Unsupported job handler", http.StatusBadRequest)
-		return
+		// For backward compatibility, treat all job types as download jobs
+		runnerJob = a.createDownloadJob(&job)
 	}
 
 	// Submit job to pool
@@ -175,7 +182,7 @@ func (a *Agent) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		a.log.Error("Failed to submit job to pool", "job_id", job.ID, "error", err)
 
 		a.jobMutex.Lock()
-		job.SetStatus(types.JobStatusFailed, "failed to queue job")
+		job.SetStatus(types.StatusFailed, "failed to queue job")
 		a.jobMutex.Unlock()
 
 		http.Error(w, "Failed to queue job", http.StatusInternalServerError)
@@ -186,7 +193,7 @@ func (a *Agent) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	jobCtx, cancelFunc := context.WithCancel(context.Background())
 	a.jobMutex.Lock()
 	a.jobCancelFuncs[job.ID] = cancelFunc
-	job.SetStatus(types.JobStatusRunning, "")
+	job.SetStatus(types.StatusRunning, "")
 	a.jobMutex.Unlock()
 
 	// Start monitoring the job context
@@ -203,105 +210,117 @@ func (a *Agent) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	var payload response.JSON = make(response.JSON)
 	payload["message"] = "Job accepted"
 	payload["job_id"] = job.ID
-	payload["status"] = string(types.JobStatusRunning)
+	payload["status"] = string(types.StatusRunning)
 
 	response.Respond(w, response.WithJSONStatus(payload, http.StatusAccepted))
 }
 
-// createHFDownloadJob creates a runner job for HuggingFace downloads
-func (a *Agent) createHFDownloadJob(job *types.Job) *runner.Job {
+// createDownloadJob creates a unified runner job for downloading a single file from a single provider
+func (a *Agent) createDownloadJob(job *types.Job) *runner.Job {
 	return runner.NewJob(job.ID, func(ctx context.Context, rjob *runner.Job) error {
-		a.log.Info("Starting HF download job", "job_id", job.ID, "files", len(job.Config.Files))
+		a.log.Info("Starting download job",
+			"job_id", job.ID,
+			"file", job.Config.FilePath,
+			"provider", job.Config.ProviderSource.ProviderID,
+		)
 
-		// Get the provider to calculate total size for progress tracking
-		prov, err := provider.GetProvider(job.Config.ProviderID)
+		// Validate job config
+		if job.Config.FilePath == "" {
+			return fmt.Errorf("no file path specified")
+		}
+		if job.Config.ProviderSource.ProviderID == "" {
+			return fmt.Errorf("no provider source specified")
+		}
+
+		// Create dataset name from repo/revision for cache
+		datasetName := fmt.Sprintf("%s-%s", job.Config.Repo, job.Config.Revision)
+
+		// Download from the single specified provider
+		err := a.downloadFromProviderSource(ctx, rjob, job, job.Config.ProviderSource, datasetName, job.Config.FilePath)
 		if err != nil {
-			return fmt.Errorf("failed to get provider %s: %w", job.Config.ProviderID, err)
+			return fmt.Errorf("download failed from provider %s: %w", job.Config.ProviderSource.ProviderID, err)
 		}
 
-		hfProv, ok := prov.(*provider.HFProvider)
-		if !ok {
-			return fmt.Errorf("provider %s is not an HF provider", job.Config.ProviderID)
-		}
-
-		// Calculate total size for progress tracking
-		var totalSize int64
-		for _, file := range job.Config.Files {
-			fileInfo, err := hfProv.GetFileInfo(ctx, job.Config.Repo, job.Config.Revision, file)
-			if err != nil {
-				a.log.Warn("Could not get file info for file", "file", file, "error", err)
-				// Continue without size info - progress will be less accurate
-				continue
-			}
-			if fileInfo != nil {
-				totalSize += int64(fileInfo.Size)
-			}
-		}
-
-		if totalSize > 0 {
-			rjob.Tracker().SetTotal(totalSize)
-			a.log.Debug("Set total download size", "job_id", job.ID, "total_bytes", totalSize)
-		}
-
-		// Download each file
-		for i, file := range job.Config.Files {
-			// Check for cancellation before processing each file
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-
-			a.log.Debug("Downloading file", "job_id", job.ID, "file", file, "progress", fmt.Sprintf("%d/%d", i+1, len(job.Config.Files)))
-
-			if err := a.downloadFileFromProvider(ctx, rjob, job, file); err != nil {
-				return fmt.Errorf("failed to download file %s: %w", file, err)
-			}
-
-			a.log.Debug("File download completed", "job_id", job.ID, "file", file)
-		}
-
-		a.log.Info("HF download job completed", "job_id", job.ID, "files_downloaded", len(job.Config.Files))
+		a.log.Info("File downloaded successfully",
+			"job_id", job.ID,
+			"file", job.Config.FilePath,
+			"provider", job.Config.ProviderSource.ProviderID,
+		)
 		return nil
 	})
 }
 
-// createP2PDownloadJob creates a runner job for P2P downloads with fallback
-func (a *Agent) createP2PDownloadJob(job *types.Job) *runner.Job {
-	return runner.NewJob(job.ID, func(ctx context.Context, rjob *runner.Job) error {
-		a.log.Info("Starting P2P download job with fallback", "job_id", job.ID, "files", len(job.Config.Files))
+// downloadFromProviderSource downloads a file from a specific provider source
+func (a *Agent) downloadFromProviderSource(ctx context.Context, rjob *runner.Job, job *types.Job, providerSource types.ProviderSource, datasetName, filePath string) error {
+	// Get the provider
+	prov, err := provider.GetProvider(providerSource.ProviderID)
+	if err != nil {
+		return fmt.Errorf("failed to get provider %s: %w", providerSource.ProviderID, err)
+	}
 
-		// For P2P jobs, try peer sources first, then fallback to provider
-		for i, file := range job.Config.Files {
-			// Check for cancellation
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
+	// Handle peer providers differently (they need the peer address)
+	if providerSource.ProviderID == "peer-main" && (providerSource.PeerAddr != types.Address{}) {
+		return a.downloadFromPeer(ctx, rjob, prov, providerSource.PeerAddr, datasetName, filePath)
+	}
 
-			a.log.Debug("Processing file for P2P download", "job_id", job.ID, "file", file, "progress", fmt.Sprintf("%d/%d", i+1, len(job.Config.Files)))
+	// Handle upstream providers (HF, S3, HTTP, etc.)
+	return a.downloadFromUpstreamProvider(ctx, rjob, prov, job, datasetName, filePath)
+}
 
-			// First, try P2P download
-			err := a.downloadFileWithP2P(ctx, rjob, job, file)
-			if err == nil {
-				a.log.Debug("File downloaded via P2P", "job_id", job.ID, "file", file)
-				continue
-			}
+// downloadFromPeer downloads a file from a peer agent
+func (a *Agent) downloadFromPeer(ctx context.Context, rjob *runner.Job, prov provider.Provider, peerAddr types.Address, datasetName, filePath string) error {
+	peerProv, ok := prov.(*provider.PeerProvider)
+	if !ok {
+		return fmt.Errorf("provider is not a peer provider")
+	}
 
-			// P2P failed, fallback to provider download
-			a.log.Debug("P2P download failed, falling back to provider", "job_id", job.ID, "file", file, "p2p_error", err)
+	// Check if peer has the file
+	hasFile, err := peerProv.GetFileAvailabilityFromPeer(ctx, peerAddr, datasetName, filePath)
+	if err != nil {
+		return fmt.Errorf("failed to check file availability on peer: %w", err)
+	}
+	if !hasFile {
+		return fmt.Errorf("peer does not have file %s", filePath)
+	}
 
-			if err := a.downloadFileFromProvider(ctx, rjob, job, file); err != nil {
-				return fmt.Errorf("failed to download file %s via provider fallback: %w", file, err)
-			}
+	// Download the file from peer
+	fileURL := fmt.Sprintf("%s/datasets/%s/files/%s", peerAddr.URL(), datasetName, filePath)
 
-			a.log.Debug("File downloaded via provider fallback", "job_id", job.ID, "file", file)
+	httpTransfer := transport.NewHTTPTransfer(
+		transport.HTTPWithClient(transport.DefaultHTTPClient()),
+	)
+
+	var reqOpts []transport.HTTPRequestOption
+	if headers := peerProv.GetHeaders(); len(headers) > 0 {
+		reqOpts = append(reqOpts, transport.HTTPRequestHeaders(headers))
+	}
+
+	err = httpTransfer.Get(ctx, fileURL, func(resp *http.Response) error {
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("peer returned status %d", resp.StatusCode)
 		}
 
-		a.log.Info("P2P download job completed", "job_id", job.ID, "files_downloaded", len(job.Config.Files))
-		return nil
-	})
+		return a.storeStreamInCache(ctx, rjob, datasetName, filePath, resp.Body, types.Bytes(resp.ContentLength))
+	}, reqOpts...)
+
+	if err != nil {
+		return fmt.Errorf("failed to download from peer: %w", err)
+	}
+
+	return nil
+}
+
+// downloadFromUpstreamProvider downloads a file from an upstream provider (HF, S3, HTTP, etc.)
+func (a *Agent) downloadFromUpstreamProvider(ctx context.Context, rjob *runner.Job, prov provider.Provider, job *types.Job, datasetName, filePath string) error {
+	// Handle different provider types
+	switch p := prov.(type) {
+	case *provider.HFProvider:
+		return a.downloadFromHFProvider(ctx, rjob, p, job, datasetName, filePath)
+	default:
+		return fmt.Errorf("unsupported provider type for upstream download: %T", prov)
+	}
 }
 
 // handleGetJob returns job status
@@ -353,7 +372,7 @@ func (a *Agent) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if job can be cancelled
-	if job.Status != types.JobStatusRunning && job.Status != types.JobStatusPending {
+	if job.Status != types.StatusRunning && job.Status != types.StatusPending {
 		a.jobMutex.Unlock()
 		a.log.Warn("Job cancellation requested for non-running job", "job_id", jobID, "status", job.Status)
 
@@ -371,7 +390,7 @@ func (a *Agent) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	cancelFunc, hasCancelFunc := a.jobCancelFuncs[jobID]
 
 	// Update job status immediately
-	job.SetStatus(types.JobStatusCancelled, "Job cancelled by request")
+	job.SetStatus(types.StatusCancelled, "Job cancelled by request")
 
 	a.jobMutex.Unlock()
 
@@ -389,7 +408,7 @@ func (a *Agent) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	var payload response.JSON = make(response.JSON)
 	payload["message"] = "Job cancellation initiated"
 	payload["job_id"] = jobID
-	payload["status"] = string(types.JobStatusCancelled)
+	payload["status"] = string(types.StatusCancelled)
 
 	response.Respond(w,
 		response.WithJSON(payload),
@@ -398,11 +417,18 @@ func (a *Agent) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 
 // handleListDatasets lists available datasets on this agent
 func (a *Agent) handleListDatasets(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement dataset discovery from storage
-	// For now, return empty list
+	datasets := a.cache.ListDatasets()
+
+	datasetList := make([]interface{}, len(datasets))
+	for i, name := range datasets {
+		datasetList[i] = map[string]interface{}{
+			"name": name,
+		}
+	}
+
 	var payload response.JSON = make(response.JSON)
-	payload["datasets"] = []interface{}{}
-	payload["count"] = 0
+	payload["datasets"] = datasetList
+	payload["count"] = len(datasets)
 
 	response.Respond(w,
 		response.WithJSON(payload),
@@ -417,12 +443,19 @@ func (a *Agent) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Implement file listing for dataset
-	// For now, return empty list
+	files := a.cache.ListFiles(datasetName)
+
+	fileList := make([]interface{}, len(files))
+	for i, path := range files {
+		fileList[i] = map[string]interface{}{
+			"path": path,
+		}
+	}
+
 	var payload response.JSON = make(response.JSON)
 	payload["dataset"] = datasetName
-	payload["files"] = []interface{}{}
-	payload["count"] = 0
+	payload["files"] = fileList
+	payload["count"] = len(files)
 
 	response.Respond(w,
 		response.WithJSON(payload),
@@ -439,10 +472,41 @@ func (a *Agent) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Implement file serving with range support
 	a.log.Debug("File requested", "dataset", datasetName, "file", filePath)
 
-	http.Error(w, "File serving not yet implemented", http.StatusNotImplemented)
+	// Check if file exists in cache
+	if !a.cache.HasFileByPath(datasetName, filePath) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	// Get file size for the reader
+	data, err := a.cache.GetFileByPath(datasetName, filePath)
+	if err != nil {
+		a.log.Error("Failed to get file from cache", "error", err)
+		http.Error(w, "Failed to read file", http.StatusInternalServerError)
+		return
+	}
+	fileSize := types.Bytes(len(data))
+
+	// Create a cache reader with rate limiting
+	rw := a.cache.NewCacheReader(datasetName, filePath, fileSize)
+	reader := rw.Reader(r.Context())
+	defer func() {
+		if closer, ok := reader.(io.Closer); ok {
+			closer.Close()
+		}
+	}()
+
+	// Serve the file by streaming from cache
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
+	w.WriteHeader(http.StatusOK)
+
+	_, err = io.Copy(w, reader)
+	if err != nil {
+		a.log.Error("Failed to stream file to client", "error", err)
+	}
 }
 
 // handleGetFileInfo returns file information for a specific file
@@ -456,36 +520,30 @@ func (a *Agent) handleGetFileInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if file exists in cache
-	if a.cache.HasFileByPath(dataset, filePath) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"exists": true}`))
-	} else {
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte(`{"exists": false}`))
+	if !a.cache.HasFileByPath(dataset, filePath) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
 	}
-}
 
-// downloadFileFromProvider downloads a file using the configured provider
-func (a *Agent) downloadFileFromProvider(ctx context.Context, rjob *runner.Job, job *types.Job, filePath string) error {
-	// Get the provider
-	prov, err := provider.GetProvider(job.Config.ProviderID)
+	// Get file data to determine size
+	data, err := a.cache.GetFileByPath(dataset, filePath)
 	if err != nil {
-		return fmt.Errorf("failed to get provider %s: %w", job.Config.ProviderID, err)
+		a.log.Error("Failed to get file from cache", "error", err)
+		http.Error(w, "Failed to read file", http.StatusInternalServerError)
+		return
 	}
 
-	// Create dataset name from repo/revision for cache
-	datasetName := fmt.Sprintf("%s-%s", job.Config.Repo, job.Config.Revision)
-
-	// Handle different provider types - delegate download to provider
-	switch prov.GetID() {
-	default:
-		// Try to cast to HFProvider for HuggingFace
-		if hfProv, ok := prov.(*provider.HFProvider); ok {
-			return a.downloadFromHFProvider(ctx, rjob, hfProv, job, datasetName, filePath)
-		} else {
-			return fmt.Errorf("unsupported provider type for download: %T", prov)
-		}
+	// Create response with file information
+	response := map[string]interface{}{
+		"file": map[string]interface{}{
+			"path": filePath,
+			"size": len(data),
+		},
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
 
 // downloadFromHFProvider delegates HuggingFace download to provider and cache
@@ -531,53 +589,32 @@ func (a *Agent) downloadFromHFProvider(ctx context.Context, rjob *runner.Job, hf
 	return nil
 }
 
-// downloadFileWithP2P attempts to download a file using peer-to-peer transfer with fallback
-func (a *Agent) downloadFileWithP2P(ctx context.Context, rjob *runner.Job, job *types.Job, filePath string) error {
-	// Check for cancellation
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	a.log.Debug("Attempting P2P download", "file", filePath, "job_id", job.ID)
-
-	// TODO: In a complete implementation, this would:
-	// 1. Query controller for peer sources for this file
-	// 2. Check each peer to see if they have the file/blocks we need
-	// 3. Download blocks from multiple peers in parallel
-	// 4. Validate block integrity using checksums
-	// 5. Delegate to cache system to fetch blocks from peers
-	// 6. Cache system handles all block assembly and storage
-
-	// For now, P2P is not fully implemented, so we'll return an error to trigger fallback
-	// This is intentional - the caller expects this and will fallback to provider download
-	a.log.Debug("P2P download not yet fully implemented, triggering fallback", "file", filePath)
-	return fmt.Errorf("P2P download not yet implemented for file %s", filePath)
-}
-
 // storeStreamInCache delegates stream storage to the cache system
 func (a *Agent) storeStreamInCache(ctx context.Context, rjob *runner.Job, datasetName, filePath string, reader io.Reader, fileSize types.Bytes) error {
-	// Create a reader with progress tracking
-	progressReader := &progressTrackingReader{
-		reader:  reader,
-		tracker: rjob.Tracker(),
+	// Create a cache-backed writer with progress tracking
+	rw := a.cache.NewCacheWriter(datasetName, filePath, fileSize,
+		types.RWWithIOReader(reader),
+		types.RWWithReaderCallback(func(n int64) {
+			rjob.Tracker().IncCurrent(n)
+		}),
+	)
+
+	// Transfer data from reader to cache writer
+	_, err := rw.Transfer(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to transfer data to cache: %w", err)
 	}
 
-	// Use the cache system's StreamStore method for direct storage
-	return a.cache.StreamStore(datasetName, filePath, progressReader, fileSize)
+	// Close the writer to ensure write-through to disk
+	return rw.CloseWriter()
 }
 
-// progressTrackingReader wraps a reader to track progress
-type progressTrackingReader struct {
-	reader  io.Reader
-	tracker *tracker.Tracker
-}
+// handleGetFileAvailability returns information about what files this agent has available
+func (a *Agent) handleGetFileAvailability(w http.ResponseWriter, r *http.Request) {
+	availability := a.cache.GetAgentFileAvailability()
 
-func (ptr *progressTrackingReader) Read(p []byte) (int, error) {
-	n, err := ptr.reader.Read(p)
-	if n > 0 {
-		ptr.tracker.IncCurrent(int64(n))
-	}
-	return n, err
+	var payload response.JSON = make(response.JSON)
+	payload["availability"] = availability
+
+	response.Respond(w, response.WithJSON(payload))
 }

@@ -25,6 +25,7 @@ type CacheFileWriter struct {
 	filepath string
 	fileSize types.Bytes
 	data     []byte
+	modified bool // Track if any writes occurred
 	mu       sync.Mutex
 }
 
@@ -47,6 +48,7 @@ func (c *Cache) NewFileWriter(dataset, filepath string, fileSize types.Bytes) *C
 		filepath: filepath,
 		fileSize: fileSize,
 		data:     make([]byte, fileSize),
+		modified: false,
 	}
 }
 
@@ -100,13 +102,18 @@ func (w *CacheFileWriter) WriteAt(p []byte, off int64) (int, error) {
 
 	// Copy data into our buffer
 	copy(w.data[off:], p)
+	w.modified = true
 
 	return len(p), nil
 }
 
 // Write implements io.Writer interface
 func (w *CacheFileWriter) Write(p []byte) (int, error) {
-	return w.WriteAt(p, int64(len(w.data)))
+	w.mu.Lock()
+	currentLen := int64(len(w.data))
+	w.mu.Unlock()
+
+	return w.WriteAt(p, currentLen)
 }
 
 // Close implements io.Closer interface - stores the complete file
@@ -114,7 +121,12 @@ func (w *CacheFileWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Store the complete file in cache
+	// Only store if the file was actually modified
+	if !w.modified {
+		return nil
+	}
+
+	// Store the complete file in cache (write-through)
 	_, err := w.cache.StoreFile(w.dataset, w.filepath, w.data)
 	return err
 }

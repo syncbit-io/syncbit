@@ -1,0 +1,31 @@
+# Agent 2 Configuration
+client:
+  controller_addr: "http://localhost:8080"
+
+daemon:
+  debug: true
+  agent_addr: "http://localhost:8082"
+  controller_addr: "http://localhost:8080"
+  providers:
+    hf-public:
+      id: "hf-public"
+      type: "hf"
+      name: "Hugging Face Public"
+    peer-main:
+      id: "peer-main"
+      type: "peer"
+      name: "Peer-to-Peer Transfer"
+
+agent:
+  id: "agent-2"
+  storage:
+    base_path: "/tmp/syncbit-test/agent2"
+    cache:
+      ram_limit: "256MB"
+      disk_limit: "0"
+      block_size: "1MB"
+  network:
+    listen_addr: "http://0.0.0.0:8082"
+    advertise_addr: "http://localhost:8082"
+    heartbeat_interval: "10s"
+    peer_timeout: "30s"

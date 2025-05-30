@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"time"
 
+	"syncbit/internal/api/request"
 	"syncbit/internal/config"
 	"syncbit/internal/core/types"
 	"syncbit/internal/transport"
@@ -111,7 +112,7 @@ func (p *HTTPProvider) GetFileFromURL(ctx context.Context, fileURL string) (*typ
 	// Add default headers
 	reqOpts := []transport.HTTPRequestOption{}
 	if len(p.headers) > 0 {
-		reqOpts = append(reqOpts, transport.HTTPRequestHeaders(p.headers))
+		reqOpts = append(reqOpts, request.WithHeaders(p.headers))
 	}
 
 	err := p.httpTransfer.Head(ctx, fileURL, callback, reqOpts...)

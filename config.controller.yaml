@@ -1,0 +1,17 @@
+# Controller Configuration
+daemon:
+  debug: true
+  controller_addr: "http://localhost:8080"
+  providers:
+    hf-public:
+      id: "hf-public"
+      type: "hf"
+      name: "Hugging Face Public"
+
+controller:
+  network:
+    listen_addr: "http://0.0.0.0:8080"
+    advertise_addr: "http://localhost:8080"
+  scheduler:
+    heartbeat_timeout: "60s"
+    schedule_interval: "5s"
