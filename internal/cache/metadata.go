@@ -54,7 +54,7 @@ func NewMetadataManager(basePath string) *MetadataManager {
 	return &MetadataManager{
 		metadataPath: metadataPath,
 		metadata: &CacheMetadata{
-			Version:   "1.0",
+			Version:   "0.1.0",
 			Datasets:  make(map[string]*DatasetMeta),
 			FileIndex: make(map[string]*FileMetadata),
 			UpdatedAt: time.Now(),
