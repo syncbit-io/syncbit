@@ -1,26 +1,280 @@
 package cache
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"syncbit/internal/config"
 	"syncbit/internal/core/types"
 )
+
+// FileEntry represents a cached file in memory
+type FileEntry struct {
+	mu        sync.RWMutex
+	Size      types.Bytes
+	Timestamp time.Time
+	Data      []byte
+}
+
+// NewFileEntry creates a file entry with the specified size
+func NewFileEntry(fileSize types.Bytes) *FileEntry {
+	return &FileEntry{
+		Size:      fileSize,
+		Timestamp: time.Now(),
+		Data:      make([]byte, fileSize),
+	}
+}
+
+// NewFileEntryWithData creates a file entry with existing data
+func NewFileEntryWithData(data []byte) *FileEntry {
+	fileData := make([]byte, len(data))
+	copy(fileData, data)
+
+	return &FileEntry{
+		Size:      types.Bytes(len(data)),
+		Timestamp: time.Now(),
+		Data:      fileData,
+	}
+}
+
+// Length returns the size of the file
+func (f *FileEntry) Length() types.Bytes {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return types.Bytes(len(f.Data))
+}
+
+// Write overwrites the file data
+func (f *FileEntry) Write(data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.Data = make([]byte, len(data))
+	copy(f.Data, data)
+	f.Size = types.Bytes(len(data))
+	f.Timestamp = time.Now()
+	return nil
+}
+
+// Read returns a copy of the file data
+func (f *FileEntry) Read() ([]byte, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	result := make([]byte, len(f.Data))
+	copy(result, f.Data)
+	return result, nil
+}
+
+// CacheMetadata represents the persistent metadata for the cache
+type CacheMetadata struct {
+	Version   string                    `json:"version"`
+	FileIndex map[string]*types.FileInfo `json:"file_index"`
+	UpdatedAt time.Time                 `json:"updated_at"`
+}
+
+// MetadataManager handles loading and saving cache metadata
+type MetadataManager struct {
+	mu           sync.RWMutex
+	metadataPath string
+	metadata     *CacheMetadata
+}
+
+// NewMetadataManager creates a new metadata manager
+func NewMetadataManager(basePath string) *MetadataManager {
+	metadataPath := filepath.Join(basePath, "cache_metadata.json")
+
+	return &MetadataManager{
+		metadataPath: metadataPath,
+		metadata: &CacheMetadata{
+			Version:   "0.1.0",
+			FileIndex: make(map[string]*types.FileInfo),
+			UpdatedAt: time.Now(),
+		},
+	}
+}
+
+// LoadMetadata loads cache metadata from disk if it exists
+func (mm *MetadataManager) LoadMetadata() error {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+
+	// Check if metadata file exists
+	if _, err := os.Stat(mm.metadataPath); os.IsNotExist(err) {
+		// No existing metadata, start fresh
+		return nil
+	}
+
+	// Read metadata file
+	data, err := os.ReadFile(mm.metadataPath)
+	if err != nil {
+		return fmt.Errorf("failed to read metadata file: %w", err)
+	}
+
+	// Parse metadata
+	var metadata CacheMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return fmt.Errorf("failed to parse metadata: %w", err)
+	}
+
+	mm.metadata = &metadata
+	return nil
+}
+
+// SaveMetadata saves the current cache metadata to disk
+func (mm *MetadataManager) SaveMetadata() error {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+
+	// Update timestamp
+	mm.metadata.UpdatedAt = time.Now()
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(mm.metadataPath), 0755); err != nil {
+		return fmt.Errorf("failed to create metadata directory: %w", err)
+	}
+
+	// Serialize metadata
+	data, err := json.MarshalIndent(mm.metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize metadata: %w", err)
+	}
+
+	// Write to temporary file first
+	tmpPath := mm.metadataPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temporary metadata file: %w", err)
+	}
+
+	// Atomic rename
+	if err := os.Rename(tmpPath, mm.metadataPath); err != nil {
+		os.Remove(tmpPath) // Clean up on error
+		return fmt.Errorf("failed to update metadata file: %w", err)
+	}
+
+	return nil
+}
+
+// AddFileMetadata adds or updates metadata for a file
+func (mm *MetadataManager) AddFileMetadata(fileKey string, fileInfo *types.FileInfo) {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+
+	mm.metadata.FileIndex[fileKey] = fileInfo
+}
+
+// GetFileMetadata retrieves metadata for a file
+func (mm *MetadataManager) GetFileMetadata(fileKey string) (*types.FileInfo, bool) {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+
+	fileInfo, exists := mm.metadata.FileIndex[fileKey]
+	return fileInfo, exists
+}
+
+// GetDatasetFiles returns all files in a dataset
+func (mm *MetadataManager) GetDatasetFiles(dataset string) map[string]string {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+
+	files := make(map[string]string)
+	for fileKey, fileInfo := range mm.metadata.FileIndex {
+		if fileInfo.Dataset == dataset {
+			files[fileInfo.Path] = fileKey
+		}
+	}
+	return files
+}
+
+// RemoveFileMetadata removes metadata for a file
+func (mm *MetadataManager) RemoveFileMetadata(fileKey string) {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+
+	delete(mm.metadata.FileIndex, fileKey)
+}
+
+// GetAllMetadata returns a copy of all metadata for external use
+func (mm *MetadataManager) GetAllMetadata() *CacheMetadata {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+
+	// Return a deep copy to avoid external modifications
+	fileIndex := make(map[string]*types.FileInfo)
+	for key, fileInfo := range mm.metadata.FileIndex {
+		// Create a copy of the FileInfo
+		fileIndex[key] = &types.FileInfo{
+			Path:    fileInfo.Path,
+			Size:    fileInfo.Size,
+			ModTime: fileInfo.ModTime,
+			ETag:    fileInfo.ETag,
+			Dataset: fileInfo.Dataset,
+			FileKey: fileInfo.FileKey,
+		}
+	}
+
+	return &CacheMetadata{
+		Version:   mm.metadata.Version,
+		FileIndex: fileIndex,
+		UpdatedAt: mm.metadata.UpdatedAt,
+	}
+}
+
+// DataSet represents a collection of files in the cache
+type DataSet struct {
+	name  string
+	mu    sync.RWMutex
+	files map[string]*FileEntry // file path -> file entry
+}
+
+// NewDataSet creates a new dataset
+func NewDataSet(name string) *DataSet {
+	return &DataSet{
+		name:  name,
+		files: make(map[string]*FileEntry),
+	}
+}
+
+// Name returns the dataset name
+func (d *DataSet) Name() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.name
+}
+
+// AddFile adds a file to the dataset
+func (d *DataSet) AddFile(path string, entry *FileEntry) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.files[path] = entry
+}
+
+// GetFile retrieves a file from the dataset
+func (d *DataSet) GetFile(path string) (*FileEntry, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	entry, ok := d.files[path]
+	if !ok {
+		return nil, fmt.Errorf("file not found: %s", path)
+	}
+	return entry, nil
+}
 
 // Cache provides a file-level cache with LRU eviction for efficient P2P file synchronization
 type Cache struct {
 	mu  sync.RWMutex
-	cfg config.CacheConfig
+	cfg types.CacheConfig
 
 	// Dataset and file organization
 	datasets map[string]*DataSet // dataset name -> dataset
 
 	// File cache for in-memory acceleration (keyed by file key)
-	fileCache map[string]*FileEntry // file key -> file entry in memory
-	fileIndex map[string]*FileIndex // file key -> file metadata
+	fileCache map[string]*FileEntry    // file key -> file entry in memory
+	fileIndex map[string]*types.FileInfo // file key -> file metadata
 
 	// LRU cache for intelligent eviction
 	lruCache *LRUCache
@@ -37,10 +291,24 @@ type Cache struct {
 
 	// Performance metrics
 	metrics *CacheMetrics
+
+	// Cleanup tracking for proper test cleanup
+	pendingWrites sync.WaitGroup
+	closing       bool
+}
+
+// CacheOption allows customizing cache behavior
+type CacheOption func(*Cache)
+
+// WithFileStorage sets a custom file storage implementation
+func WithFileStorage(storage FileStorage) CacheOption {
+	return func(c *Cache) {
+		c.fileStorage = storage
+	}
 }
 
 // NewCache creates a new cache instance with the specified configuration
-func NewCache(cfg config.CacheConfig, basePath string) (*Cache, error) {
+func NewCache(cfg types.CacheConfig, basePath string, opts ...CacheOption) (*Cache, error) {
 	// Initialize file storage
 	fileStorage, err := NewDiskFileStorage(basePath)
 	if err != nil {
@@ -57,7 +325,7 @@ func NewCache(cfg config.CacheConfig, basePath string) (*Cache, error) {
 		cfg:             cfg,
 		datasets:        make(map[string]*DataSet),
 		fileCache:       make(map[string]*FileEntry),
-		fileIndex:       make(map[string]*FileIndex),
+		fileIndex:       make(map[string]*types.FileInfo),
 		lruCache:        lruCache,
 		ramUsage:        0,
 		diskUsage:       0,
@@ -74,6 +342,11 @@ func NewCache(cfg config.CacheConfig, basePath string) (*Cache, error) {
 	// Restore cache state from metadata rather than scanning disk
 	if err := cache.restoreFromMetadata(); err != nil {
 		return nil, fmt.Errorf("failed to restore cache from metadata: %w", err)
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(cache)
 	}
 
 	return cache, nil
@@ -134,9 +407,8 @@ func (c *Cache) StoreFile(dataset, filepath string, data []byte) (string, error)
 	c.datasets[dataset].AddFile(filepath, fileEntry)
 
 	// Create/update file index entry
-	fileIdx := NewFileIndex(dataset, filepath, fileKey, fileSize)
-	fileIdx.MarkComplete()
-	c.fileIndex[fileKey] = fileIdx
+	fileInfo := types.NewCacheFileInfo(dataset, filepath, fileSize, time.Now(), "")
+	c.fileIndex[fileKey] = fileInfo
 
 	// Update LRU cache tracking
 	c.lruCache.Add(fileKey, fileSize)
@@ -153,21 +425,13 @@ func (c *Cache) StoreFile(dataset, filepath string, data []byte) (string, error)
 	}
 
 	// Create and save metadata for the file
-	fileMeta := &FileMetadata{
-		Dataset:   dataset,
-		FilePath:  filepath,
-		FileKey:   fileKey,
-		Size:      fileSize,
-		ModTime:   time.Now(),
-		ETag:      "", // TODO: Calculate ETag if needed
-		Timestamp: time.Now(),
-		Complete:  true,
-		OnDisk:    true,
-	}
+	fileMeta := types.NewCacheFileInfo(dataset, filepath, fileSize, time.Now(), "")
 	c.metadataManager.AddFileMetadata(fileKey, fileMeta)
 
 	// Save metadata to disk (async to avoid blocking)
+	c.pendingWrites.Add(1)
 	go func() {
+		defer c.pendingWrites.Done()
 		if err := c.metadataManager.SaveMetadata(); err != nil {
 			// Log error but don't fail the operation
 			// TODO: Add proper logging
@@ -207,15 +471,15 @@ func (c *Cache) GetFile(fileKey string) ([]byte, error) {
 	c.mu.RUnlock()
 
 	// Try reading from actual file on disk
-	fileIdx, exists := func() (*FileIndex, bool) {
+	fileInfo, exists := func() (*types.FileInfo, bool) {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		idx, ok := c.fileIndex[fileKey]
-		return idx, ok
+		info, ok := c.fileIndex[fileKey]
+		return info, ok
 	}()
 
 	if exists {
-		data, err := c.fileStorage.ReadFile(fileIdx.Dataset, fileIdx.FilePath)
+		data, err := c.fileStorage.ReadFile(fileInfo.Dataset, fileInfo.Path)
 		if err == nil {
 			// Load back into memory cache if there's room
 			c.mu.Lock()
@@ -260,10 +524,10 @@ func (c *Cache) HasFile(fileKey string) bool {
 		return true
 	}
 
-	// Check if we have metadata for this file
-	if fileIdx, exists := c.fileIndex[fileKey]; exists && fileIdx.Complete {
+	// Check if we have metadata for this file (presence indicates completeness)
+	if fileInfo, exists := c.fileIndex[fileKey]; exists {
 		// Verify it exists on disk
-		return c.fileStorage.FileExists(fileIdx.Dataset, fileIdx.FilePath)
+		return c.fileStorage.FileExists(fileInfo.Dataset, fileInfo.Path)
 	}
 
 	return false
@@ -317,10 +581,16 @@ func (c *Cache) GetCacheStats() CacheStats {
 	perfStats := c.metrics.GetStats()
 	throughputStats := perfStats.GetThroughputStats()
 
+	// Get real disk usage from file storage
+	realDiskUsage := c.diskUsage
+	if diskUsage, err := c.fileStorage.GetTotalDiskUsage(); err == nil {
+		realDiskUsage = diskUsage
+	}
+
 	stats := CacheStats{
 		RAMUsage:        c.ramUsage,
 		RAMLimit:        c.cfg.RAMLimit,
-		DiskUsage:       c.diskUsage,
+		DiskUsage:       realDiskUsage,
 		DiskLimit:       c.cfg.DiskLimit,
 		FilesInRAM:      len(c.fileCache),
 		TotalFiles:      len(c.fileIndex),
@@ -336,6 +606,20 @@ func (c *Cache) GetCacheStats() CacheStats {
 // GetMetrics returns the performance metrics tracker
 func (c *Cache) GetMetrics() *CacheMetrics {
 	return c.metrics
+}
+
+// UpdateDiskUsage updates the tracked disk usage by querying the actual disk usage
+func (c *Cache) UpdateDiskUsage() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	diskUsage, err := c.fileStorage.GetTotalDiskUsage()
+	if err != nil {
+		return fmt.Errorf("failed to get disk usage: %w", err)
+	}
+
+	c.diskUsage = diskUsage
+	return nil
 }
 
 // ResetMetrics resets all performance metrics
@@ -461,12 +745,18 @@ func (c *Cache) scanDiskFiles() error {
 
 		// Create file index entry for existing file
 		fileKey := GetFileKey(dataset, filepath)
-		fileIdx := NewFileIndex(dataset, filepath, fileKey, fileSize)
-		fileIdx.MarkComplete()
-		c.fileIndex[fileKey] = fileIdx
+		fileInfo := types.NewCacheFileInfo(dataset, filepath, fileSize, time.Now(), "")
+		c.fileIndex[fileKey] = fileInfo
 
 		// Update disk usage tracking
 		c.diskUsage += fileSize
+
+		// Periodically update real disk usage (every 100 files or so)
+		if len(c.fileIndex) % 100 == 0 {
+			if realUsage, err := c.fileStorage.GetTotalDiskUsage(); err == nil {
+				c.diskUsage = realUsage
+			}
+		}
 	})
 }
 
@@ -479,36 +769,43 @@ func (c *Cache) restoreFromMetadata() error {
 		return c.scanDiskFiles()
 	}
 
-	// Restore datasets
-	for _, datasetMeta := range metadata.Datasets {
-		c.datasets[datasetMeta.Name] = NewDataSet(datasetMeta.Name)
+	// Restore datasets by discovering them from FileIndex
+	datasetNames := make(map[string]bool)
+	for _, fileInfo := range metadata.FileIndex {
+		if fileInfo.Dataset != "" {
+			datasetNames[fileInfo.Dataset] = true
+		}
+	}
+	for datasetName := range datasetNames {
+		c.datasets[datasetName] = NewDataSet(datasetName)
 	}
 
 	// Restore file index and validate files still exist on disk
-	for fileKey, fileMeta := range metadata.FileIndex {
+	for fileKey, fileInfo := range metadata.FileIndex {
 		// Check if file actually exists on disk
-		if !c.fileStorage.FileExists(fileMeta.Dataset, fileMeta.FilePath) {
+		if !c.fileStorage.FileExists(fileInfo.Dataset, fileInfo.Path) {
 			// File was deleted externally, remove from metadata
 			c.metadataManager.RemoveFileMetadata(fileKey)
 			continue
 		}
 
-		// Create file index entry from metadata
-		fileIdx := NewFileIndex(fileMeta.Dataset, fileMeta.FilePath, fileMeta.FileKey, fileMeta.Size)
-		if fileMeta.Complete {
-			fileIdx.MarkComplete()
-		}
-		c.fileIndex[fileKey] = fileIdx
+		// Create file index entry from metadata (presence indicates completeness)
+		c.fileIndex[fileKey] = fileInfo
 
 		// Add file to dataset
-		if dataset, exists := c.datasets[fileMeta.Dataset]; exists {
+		if dataset, exists := c.datasets[fileInfo.Dataset]; exists {
 			// Create a placeholder file entry (actual data will be loaded on demand)
-			fileEntry := NewFileEntry(fileMeta.Size)
-			dataset.AddFile(fileMeta.FilePath, fileEntry)
+			fileEntry := NewFileEntry(fileInfo.Size)
+			dataset.AddFile(fileInfo.Path, fileEntry)
 		}
 
 		// Update disk usage tracking
-		c.diskUsage += fileMeta.Size
+		c.diskUsage += fileInfo.Size
+	}
+
+	// Get real disk usage after restoring metadata
+	if realUsage, err := c.fileStorage.GetTotalDiskUsage(); err == nil {
+		c.diskUsage = realUsage
 	}
 
 	// Save metadata to persist any changes (like removed files)
@@ -521,18 +818,18 @@ func (c *Cache) GetCacheMetadata() *CacheMetadata {
 }
 
 // GetFileMetadata returns metadata for a specific file
-func (c *Cache) GetFileMetadata(fileKey string) (*FileMetadata, bool) {
+func (c *Cache) GetFileMetadata(fileKey string) (*types.FileInfo, bool) {
 	return c.metadataManager.GetFileMetadata(fileKey)
 }
 
 // GetDatasetFiles returns all files in a dataset with their metadata
-func (c *Cache) GetDatasetFiles(dataset string) map[string]*FileMetadata {
+func (c *Cache) GetDatasetFiles(dataset string) map[string]*types.FileInfo {
 	files := c.metadataManager.GetDatasetFiles(dataset)
-	result := make(map[string]*FileMetadata)
+	result := make(map[string]*types.FileInfo)
 
 	for filepath, fileKey := range files {
-		if meta, exists := c.metadataManager.GetFileMetadata(fileKey); exists {
-			result[filepath] = meta
+		if fileInfo, exists := c.metadataManager.GetFileMetadata(fileKey); exists {
+			result[filepath] = fileInfo
 		}
 	}
 
@@ -544,14 +841,75 @@ func (c *Cache) GetAgentFileAvailability() map[string]map[string]bool {
 	metadata := c.metadataManager.GetAllMetadata()
 	availability := make(map[string]map[string]bool)
 
-	for _, fileMeta := range metadata.FileIndex {
-		if fileMeta.Complete && fileMeta.OnDisk {
-			if availability[fileMeta.Dataset] == nil {
-				availability[fileMeta.Dataset] = make(map[string]bool)
-			}
-			availability[fileMeta.Dataset][fileMeta.FilePath] = true
+	for _, fileInfo := range metadata.FileIndex {
+		// If it's in the metadata, it's available (presence indicates completeness)
+		if availability[fileInfo.Dataset] == nil {
+			availability[fileInfo.Dataset] = make(map[string]bool)
 		}
+		availability[fileInfo.Dataset][fileInfo.Path] = true
 	}
 
 	return availability
+}
+
+// UpdateFileMetadata updates the metadata for an existing file with source information
+func (c *Cache) UpdateFileMetadata(dataset, filepath string, sourceInfo *types.FileInfo) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Find the file in our dataset
+	datasetInfo, exists := c.datasets[dataset]
+	if !exists {
+		return fmt.Errorf("dataset %s not found", dataset)
+	}
+
+	_, exists = datasetInfo.files[filepath]
+	if !exists {
+		return fmt.Errorf("file %s not found in dataset %s", filepath, dataset)
+	}
+
+	fileKey := GetFileKey(dataset, filepath)
+
+	// Update the metadata if we have source information
+	if sourceInfo != nil {
+		fileInfo, exists := c.metadataManager.GetFileMetadata(fileKey)
+		if exists && fileInfo != nil {
+			if !sourceInfo.ModTime.IsZero() {
+				fileInfo.ModTime = sourceInfo.ModTime
+			}
+			if sourceInfo.ETag != "" {
+				fileInfo.ETag = sourceInfo.ETag
+			}
+			if sourceInfo.Size > 0 {
+				fileInfo.Size = sourceInfo.Size
+			}
+
+			// Update the metadata in memory and schedule disk save
+			c.metadataManager.AddFileMetadata(fileKey, fileInfo)
+			
+			// Save metadata to disk (async to avoid blocking)
+			c.pendingWrites.Add(1)
+			go func() {
+				defer c.pendingWrites.Done()
+				if err := c.metadataManager.SaveMetadata(); err != nil {
+					// Log error but don't fail the operation
+					// TODO: Add proper logging when available
+				}
+			}()
+		}
+	}
+
+	return nil
+}
+
+// Close ensures proper cleanup of any background operations
+func (c *Cache) Close() error {
+	c.mu.Lock()
+	c.closing = true
+	c.mu.Unlock()
+
+	// Wait for all pending background operations to complete
+	c.pendingWrites.Wait()
+
+	return nil
 }

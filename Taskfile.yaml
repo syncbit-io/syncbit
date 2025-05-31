@@ -28,8 +28,8 @@ tasks:
     desc: "Build syncbit"
     deps: [deps]
     cmds:
-    - go build -o bin/syncbit ./cmd/syncbit
-    - go build -o bin/syncbitd ./cmd/syncbitd
+    - go build -o ./bin ./cmd/...
+    # - go build -o bin/syncbitd ./cmd/syncbitd
     sources:
     - "**/*.go"
     generates:

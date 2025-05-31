@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"sync"
 
-	"syncbit/internal/config"
+	"syncbit/internal/core/types"
 )
 
 // Provider factory functions for creating new provider instances
-var providerFactories = make(map[string]func(config.ProviderConfig, config.TransferConfig) (Provider, error))
+var providerFactories = make(map[string]func(types.ProviderConfig, types.TransferConfig) (Provider, error))
 
 // Global registry of configured provider instances
 var (
@@ -23,13 +23,13 @@ type Provider interface {
 }
 
 // RegisterProviderFactory registers a provider factory function by type
-func RegisterProviderFactory(providerType string, factory func(config.ProviderConfig, config.TransferConfig) (Provider, error)) {
+func RegisterProviderFactory(providerType string, factory func(types.ProviderConfig, types.TransferConfig) (Provider, error)) {
 	providerFactories[providerType] = factory
 }
 
 // InitializeProviders initializes all providers from configuration
 // This should be called at daemon startup
-func InitializeProviders(providers map[string]config.ProviderConfig) error {
+func InitializeProviders(providers map[string]types.ProviderConfig) error {
 	registryMutex.Lock()
 	defer registryMutex.Unlock()
 
@@ -44,8 +44,11 @@ func InitializeProviders(providers map[string]config.ProviderConfig) error {
 			return fmt.Errorf("unknown provider type: %s for provider %s", cfg.Type, providerID)
 		}
 
-		// Use default transfer config for now - could be per-provider in the future
-		transferCfg := config.DefaultTransferConfig()
+		// Use provider-specific transfer config if available, otherwise use defaults
+		transferCfg := types.DefaultTransferConfig()
+		if cfg.Transfer != nil {
+			transferCfg = *cfg.Transfer
+		}
 
 		provider, err := factory(cfg, transferCfg)
 		if err != nil {
@@ -84,7 +87,7 @@ func ListProviders() []string {
 }
 
 // Legacy function for backward compatibility
-func NewProvider(cfg config.ProviderConfig, transferCfg config.TransferConfig) (Provider, error) {
+func NewProvider(cfg types.ProviderConfig, transferCfg types.TransferConfig) (Provider, error) {
 	if cfg.Type == "" {
 		return nil, fmt.Errorf("provider type is required")
 	}

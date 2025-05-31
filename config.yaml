@@ -47,14 +47,11 @@ agent:
 
     # Cache configuration
     cache:
-      # Maximum RAM usage for block cache (parsed as bytes, supports K/M/G/T suffixes)
-      ram_limit: "1GB"
+      # Maximum RAM usage for file cache (parsed as bytes, supports K/M/G/T suffixes)
+      ram_limit: "4GB"
 
-      # Maximum disk usage for all datasets (0 = unlimited)
+      # Maximum disk usage for cache (0 = unlimited)
       disk_limit: "0"
-
-      # Block size for chunking files (default: 1MB)
-      block_size: "1MB"
 
   # Network configuration for peer-to-peer communication
   network:

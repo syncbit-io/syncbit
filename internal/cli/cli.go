@@ -27,12 +27,11 @@ func NewClient(url string) *Client {
 }
 
 // SubmitJob submits a new download job to the controller
-func (c *Client) SubmitJob(jobID string, config types.JobConfig, handler types.JobHandler) (*types.Job, error) {
+func (c *Client) SubmitJob(ctx context.Context, jobID string, config types.JobConfig, handler types.JobHandler) (*types.Job, error) {
 	job := types.NewJob(jobID, handler, config)
 
-	ctx := context.Background()
 	url := c.ControllerURL + "/jobs"
-	var response map[string]interface{}
+	var response map[string]any
 
 	err := c.httpClient.Post(ctx, url, func(resp *http.Response) error {
 		defer resp.Body.Close()
@@ -53,8 +52,7 @@ func (c *Client) SubmitJob(jobID string, config types.JobConfig, handler types.J
 }
 
 // GetJob retrieves a job by ID
-func (c *Client) GetJob(jobID string) (*types.Job, error) {
-	ctx := context.Background()
+func (c *Client) GetJob(ctx context.Context, jobID string) (*types.Job, error) {
 	url := fmt.Sprintf("%s/jobs/%s", c.ControllerURL, jobID)
 	var job types.Job
 
@@ -76,8 +74,7 @@ func (c *Client) GetJob(jobID string) (*types.Job, error) {
 }
 
 // ListJobs retrieves all jobs
-func (c *Client) ListJobs() ([]*types.Job, error) {
-	ctx := context.Background()
+func (c *Client) ListJobs(ctx context.Context) ([]*types.Job, error) {
 	url := c.ControllerURL + "/jobs"
 	var response struct {
 		Jobs []*types.Job `json:"jobs"`
@@ -101,8 +98,7 @@ func (c *Client) ListJobs() ([]*types.Job, error) {
 }
 
 // CancelJob cancels a job by ID
-func (c *Client) CancelJob(jobID string) error {
-	ctx := context.Background()
+func (c *Client) CancelJob(ctx context.Context, jobID string) error {
 	url := fmt.Sprintf("%s/jobs/%s", c.ControllerURL, jobID)
 
 	err := c.httpClient.Delete(ctx, url, func(resp *http.Response) error {

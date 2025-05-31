@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"time"
 
-	"syncbit/internal/config"
 	"syncbit/internal/core/types"
 	"syncbit/internal/transport"
 )
@@ -24,19 +23,22 @@ const (
 // Provides authentication and metadata services for HuggingFace repositories.
 type HFProvider struct {
 	id           string
-	cfg          *config.ProviderConfig
-	transferCfg  config.TransferConfig
+	cfg          *types.ProviderConfig
+	transferCfg  types.TransferConfig
 	token        string
 	httpTransfer *transport.HTTPTransfer
 }
 
 // NewHFProvider creates a new HFProvider.
 // Configures authentication for HuggingFace API access.
-func NewHFProvider(cfg config.ProviderConfig, transferCfg config.TransferConfig) (Provider, error) {
-	// Create HTTP transfer with headers including auth token if provided
+func NewHFProvider(cfg types.ProviderConfig, transferCfg types.TransferConfig) (Provider, error) {
+	// Create HTTP transfer with rate limiting
 	httpOpts := []transport.HTTPTransferOption{}
-	if cfg.Token != "" {
-		httpOpts = append(httpOpts, transport.HTTPWithClient(transport.DefaultHTTPClient()))
+	
+	// Create rate limiter based on transfer config
+	if transferCfg.RateLimit > 0 {
+		limiter := types.NewRateLimiter(types.Bytes(transferCfg.RateLimit))
+		httpOpts = append(httpOpts, transport.HTTPWithRateLimiter(limiter))
 	}
 
 	return &HFProvider{

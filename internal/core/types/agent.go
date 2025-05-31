@@ -1,6 +1,9 @@
 package types
 
-import "time"
+import (
+	"net/url"
+	"time"
+)
 
 // AgentState represents the current state reported by an agent
 type AgentState struct {
@@ -13,7 +16,7 @@ type AgentState struct {
 // Agent represents a registered agent
 type Agent struct {
 	ID            string     `json:"id"`             // Unique agent identifier
-	AdvertiseAddr Address    `json:"advertise_addr"` // Address other agents can reach this one at
+	AdvertiseAddr *url.URL   `json:"advertise_addr"` // Address other agents can reach this one at
 	LastHeartbeat time.Time  `json:"last_heartbeat"` // Last time we heard from this agent
 	State         AgentState `json:"state"`          // Current agent state
 }

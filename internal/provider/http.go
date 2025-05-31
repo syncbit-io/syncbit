@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"syncbit/internal/api/request"
-	"syncbit/internal/config"
 	"syncbit/internal/core/types"
 	"syncbit/internal/transport"
 )
@@ -17,17 +16,20 @@ import (
 // Provides authentication and connection services for HTTP access
 type HTTPProvider struct {
 	id           string
-	cfg          *config.ProviderConfig
+	cfg          *types.ProviderConfig
 	token        string
 	headers      map[string]string
 	httpTransfer *transport.HTTPTransfer
 }
 
-func NewHTTPProvider(cfg config.ProviderConfig, transferCfg config.TransferConfig) (Provider, error) {
-	// Create HTTP transfer with optional auth token
+func NewHTTPProvider(cfg types.ProviderConfig, transferCfg types.TransferConfig) (Provider, error) {
+	// Create HTTP transfer with rate limiting
 	httpOpts := []transport.HTTPTransferOption{}
-	if cfg.Token != "" {
-		httpOpts = append(httpOpts, transport.HTTPWithClient(transport.DefaultHTTPClient()))
+	
+	// Create rate limiter based on transfer config
+	if transferCfg.RateLimit > 0 {
+		limiter := types.NewRateLimiter(types.Bytes(transferCfg.RateLimit))
+		httpOpts = append(httpOpts, transport.HTTPWithRateLimiter(limiter))
 	}
 
 	// Copy headers to avoid modifying the original config

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 
 	"syncbit/internal/api"
@@ -16,26 +15,26 @@ import (
 // RegisterHandlers registers the handlers for the controller.
 func (c *Controller) RegisterHandlers(registrar api.HandlerRegistrar) error {
 	// Health endpoint
-	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/health", c.handleHealth))
+	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/health", c.handleHealth))
 
 	// Stats and metrics endpoints
-	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/stats", c.handleGetStats))
-	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/cache/stats", c.handleGetCacheStats))
-	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/jobs/stats", c.handleGetJobStats))
+	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/stats", c.handleGetStats))
+	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/cache/stats", c.handleGetCacheStats))
+	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/jobs/stats", c.handleGetJobStats))
 
 	// Job management endpoints using Go 1.22+ path parameters
-	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/jobs", c.handleListJobs))
-	registrar.RegisterHandler(api.NewRoute(api.MethodPost, "/jobs", c.handleSubmitJob))
-	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/jobs/{id}", c.handleGetJob))
+	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/jobs", c.handleListJobs))
+	registrar.RegisterHandler(api.NewRoute(http.MethodPost, "/jobs", c.handleSubmitJob))
+	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/jobs/{id}", c.handleGetJob))
 
 	// Agent endpoints for job management
-	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/jobs/next", c.handleGetNextJob))
-	registrar.RegisterHandler(api.NewRoute(api.MethodPost, "/jobs/{id}/status", c.handleUpdateJobStatus))
+	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/jobs/next", c.handleGetNextJob))
+	registrar.RegisterHandler(api.NewRoute(http.MethodPost, "/jobs/{id}/status", c.handleUpdateJobStatus))
 
 	// Agent registration and state management endpoints
-	registrar.RegisterHandler(api.NewRoute(api.MethodPost, "/agents/register", c.handleRegisterAgent))
-	registrar.RegisterHandler(api.NewRoute(api.MethodPost, "/agents/{id}/heartbeat", c.handleAgentHeartbeat))
-	registrar.RegisterHandler(api.NewRoute(api.MethodGet, "/agents", c.handleListAgents))
+	registrar.RegisterHandler(api.NewRoute(http.MethodPost, "/agents/register", c.handleRegisterAgent))
+	registrar.RegisterHandler(api.NewRoute(http.MethodPost, "/agents/{id}/heartbeat", c.handleAgentHeartbeat))
+	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/agents", c.handleListAgents))
 
 	return nil
 }
@@ -85,13 +84,13 @@ func (c *Controller) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Submit job to controller
-	if err := c.SubmitJob(&job); err != nil {
+	if err := c.SubmitJob(r.Context(), &job); err != nil {
 		c.logger.Error("Failed to submit job", "job_id", job.ID, "error", err)
 		http.Error(w, fmt.Sprintf("Failed to submit job: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"message": "Job submitted successfully",
 		"job_id":  job.ID,
 		"status":  string(job.Status),
@@ -141,15 +140,10 @@ func (c *Controller) handleGetJob(w http.ResponseWriter, r *http.Request) {
 // handleGetNextJob returns the next job for an agent to process
 func (c *Controller) handleGetNextJob(w http.ResponseWriter, r *http.Request) {
 	// Set a timeout for waiting for jobs
-	ctx := r.Context()
-	job, err := c.GetNextJob(ctx)
+	job, err := c.GetNextJob()
 	if err != nil {
-		if err == ctx.Err() {
-			http.Error(w, "Request timeout", http.StatusRequestTimeout)
-		} else {
-			c.logger.Error("Failed to get next job", "error", err)
-			http.Error(w, "Failed to get next job", http.StatusInternalServerError)
-		}
+		c.logger.Error("Failed to get next job", "error", err)
+		http.Error(w, "Failed to get next job", http.StatusInternalServerError)
 		return
 	}
 
@@ -225,19 +219,9 @@ func (c *Controller) handleRegisterAgent(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	port, err := strconv.Atoi(advertiseAddr.Port())
-	if err != nil {
-		http.Error(w, "invalid port in advertise address", http.StatusBadRequest)
-		return
-	}
-
 	agent := &types.Agent{
-		ID: registrationRequest.ID,
-		AdvertiseAddr: types.NewAddress(
-			advertiseAddr.Hostname(),
-			port,
-			types.WithScheme(types.Scheme(advertiseAddr.Scheme)),
-		),
+		ID:            registrationRequest.ID,
+		AdvertiseAddr: advertiseAddr,
 		State: types.AgentState{
 			DiskUsed:      0,
 			DiskAvailable: 0,
@@ -306,7 +290,7 @@ func (c *Controller) handleListAgents(w http.ResponseWriter, r *http.Request) {
 // handleGetStats returns overall controller statistics
 func (c *Controller) handleGetStats(w http.ResponseWriter, r *http.Request) {
 	jobStats := c.scheduler.GetJobStats()
-	cacheStats := c.GetCacheStats()
+	cacheStats := c.GetCacheStats(r.Context())
 
 	var payload response.JSON = make(response.JSON)
 	payload["job_stats"] = jobStats
@@ -318,7 +302,7 @@ func (c *Controller) handleGetStats(w http.ResponseWriter, r *http.Request) {
 
 // handleGetCacheStats returns cache statistics from controller perspective
 func (c *Controller) handleGetCacheStats(w http.ResponseWriter, r *http.Request) {
-	stats := c.GetCacheStats()
+	stats := c.GetCacheStats(r.Context())
 
 	var payload response.JSON = make(response.JSON)
 	payload["cache_stats"] = stats

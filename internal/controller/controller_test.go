@@ -1,12 +1,12 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +14,15 @@ import (
 	"syncbit/internal/core/logger"
 	"syncbit/internal/core/types"
 )
+
+// mustParseURL is a helper for parsing URLs in tests
+func mustParseURL(rawURL string) *url.URL {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		panic("invalid test URL: " + rawURL)
+	}
+	return u
+}
 
 // TestController_AgentRegistration tests agent registration and tracking
 func TestController_AgentRegistration(t *testing.T) {
@@ -59,8 +68,8 @@ func TestController_AgentRegistration(t *testing.T) {
 	}
 
 	foundAgent, _ = controller.GetAgent("agent-1")
-	if foundAgent.AdvertiseAddr.Port != 8091 {
-		t.Fatalf("Agent address not updated, got port %d", foundAgent.AdvertiseAddr.Port)
+	if foundAgent.AdvertiseAddr.Port() != "8091" {
+		t.Fatalf("Agent address not updated, got port %s", foundAgent.AdvertiseAddr.Port())
 	}
 }
 
@@ -179,7 +188,7 @@ func TestController_JobScheduling(t *testing.T) {
 
 	// Submit job and verify it goes to the agent with better score
 	job := createTestJob("schedule-test-1", "large-model.bin")
-	if err := controller.SubmitJob(job); err != nil {
+	if err := controller.SubmitJob(context.Background(), job); err != nil {
 		t.Fatalf("Failed to submit job: %v", err)
 	}
 
@@ -401,9 +410,10 @@ func TestController_JobLifecycle(t *testing.T) {
 // Helper functions for creating test objects
 
 func createTestController(t *testing.T) *Controller {
-	cfg := &Config{
-		Listen: types.NewAddress("localhost", 8080),
-		Debug:  true,
+	cfg := &types.ControllerConfig{
+		ListenAddr:   mustParseURL("http://localhost:8080"),
+		AgentTimeout: "5m",
+		SyncInterval: "30s",
 	}
 
 	controller := &Controller{
@@ -451,17 +461,11 @@ func createTestJob(id, filePath string) *types.Job {
 	}
 }
 
-// parseAddress is a helper to parse URL strings into Address types
-func parseAddress(urlStr string) types.Address {
+// parseAddress is a helper to parse URL strings into *url.URL
+func parseAddress(urlStr string) *url.URL {
 	u, err := url.Parse(urlStr)
 	if err != nil {
 		panic(fmt.Sprintf("Invalid URL: %s", urlStr))
 	}
-
-	port, err := strconv.Atoi(u.Port())
-	if err != nil {
-		panic(fmt.Sprintf("Invalid port in URL: %s", urlStr))
-	}
-
-	return types.NewAddress(u.Hostname(), port, types.WithScheme(types.Scheme(u.Scheme)))
+	return u
 }

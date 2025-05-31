@@ -22,7 +22,7 @@ func TestJobScheduler_BasicScheduling(t *testing.T) {
 	agents := []*types.Agent{
 		{
 			ID:            "agent-1",
-			AdvertiseAddr: types.NewAddress("localhost", 8081),
+			AdvertiseAddr: mustParseURL("http://localhost:8081"),
 			State: types.AgentState{
 				DiskAvailable: types.Bytes(50 * 1024 * 1024 * 1024), // 50GB
 				ActiveJobs:    []string{},
@@ -31,7 +31,7 @@ func TestJobScheduler_BasicScheduling(t *testing.T) {
 		},
 		{
 			ID:            "agent-2",
-			AdvertiseAddr: types.NewAddress("localhost", 8082),
+			AdvertiseAddr: mustParseURL("http://localhost:8082"),
 			State: types.AgentState{
 				DiskAvailable: types.Bytes(20 * 1024 * 1024 * 1024), // 20GB
 				ActiveJobs:    []string{"job-1"},
@@ -124,7 +124,7 @@ func TestJobScheduler_AgentSelection(t *testing.T) {
 	agents := []*types.Agent{
 		{
 			ID:            "high-capacity",
-			AdvertiseAddr: types.NewAddress("localhost", 8081),
+			AdvertiseAddr: mustParseURL("http://localhost:8081"),
 			State: types.AgentState{
 				DiskAvailable: types.Bytes(50 * 1024 * 1024 * 1024),
 				ActiveJobs:    []string{},
@@ -133,7 +133,7 @@ func TestJobScheduler_AgentSelection(t *testing.T) {
 		},
 		{
 			ID:            "busy-agent",
-			AdvertiseAddr: types.NewAddress("localhost", 8082),
+			AdvertiseAddr: mustParseURL("http://localhost:8082"),
 			State: types.AgentState{
 				DiskAvailable: types.Bytes(50 * 1024 * 1024 * 1024),
 				ActiveJobs:    []string{"job-1", "job-2", "job-3"},
@@ -142,7 +142,7 @@ func TestJobScheduler_AgentSelection(t *testing.T) {
 		},
 		{
 			ID:            "low-capacity",
-			AdvertiseAddr: types.NewAddress("localhost", 8083),
+			AdvertiseAddr: mustParseURL("http://localhost:8083"),
 			State: types.AgentState{
 				DiskAvailable: types.Bytes(1 * 1024 * 1024 * 1024),
 				ActiveJobs:    []string{},

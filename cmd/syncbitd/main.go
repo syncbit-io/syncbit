@@ -1,9 +1,9 @@
 package main
 
 import (
-	"context"
 	"syncbit/internal/agent"
 	"syncbit/internal/controller"
+	"syncbit/internal/core/types"
 
 	"github.com/alecthomas/kong"
 )
@@ -25,13 +25,21 @@ type CLI struct {
 }
 
 func (a *AgentCmd) Run() error {
+	// Create signal-aware context for the application
+	ctx, cancel := types.DefaultSignalNotifySubContext()
+	defer cancel()
+
 	ag := agent.NewAgent(a.ConfigFile, a.Debug)
-	return ag.Run(context.Background())
+	return ag.Run(ctx)
 }
 
 func (c *ControllerCmd) Run() error {
+	// Create signal-aware context for the application
+	ctx, cancel := types.DefaultSignalNotifySubContext()
+	defer cancel()
+
 	ctrl := controller.NewController(c.ConfigFile, c.Debug)
-	return ctrl.Run(context.Background())
+	return ctrl.Run(ctx)
 }
 
 func main() {

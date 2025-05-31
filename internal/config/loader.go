@@ -10,7 +10,7 @@ import (
 // LoadYAML loads a YAML configuration file into the provided config structure.
 // If the file doesn't exist or can't be parsed, it returns the original config unchanged
 // and logs the error (but doesn't fail).
-func LoadYAML(configFile string, config interface{}) error {
+func LoadYAML(configFile string, config any) error {
 	if configFile == "" {
 		return fmt.Errorf("config file path is empty")
 	}
@@ -32,7 +32,7 @@ func LoadYAML(configFile string, config interface{}) error {
 // LoadYAMLWithDefaults loads a YAML configuration file into the provided config structure.
 // If loading fails, it silently continues with the existing values in config.
 // This is useful when you want to load optional configuration files without failing.
-func LoadYAMLWithDefaults(configFile string, config interface{}) {
+func LoadYAMLWithDefaults(configFile string, config any) {
 	if configFile == "" {
 		return
 	}
@@ -49,7 +49,7 @@ func LoadYAMLWithDefaults(configFile string, config interface{}) {
 }
 
 // SaveYAML saves a configuration structure to a YAML file.
-func SaveYAML(configFile string, config interface{}) error {
+func SaveYAML(configFile string, config any) error {
 	if configFile == "" {
 		return fmt.Errorf("config file path is empty")
 	}
@@ -85,7 +85,7 @@ func FileExists(configFile string) bool {
 }
 
 // LoadYAMLOrCreate loads a YAML configuration file, or creates it with default values if it doesn't exist.
-func LoadYAMLOrCreate(configFile string, config interface{}) error {
+func LoadYAMLOrCreate(configFile string, config any) error {
 	if FileExists(configFile) {
 		return LoadYAML(configFile, config)
 	}

@@ -5,16 +5,25 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	"syncbit/internal/cache"
-	"syncbit/internal/config"
 	"syncbit/internal/core/logger"
 	"syncbit/internal/core/types"
 	"syncbit/internal/runner"
 	"syncbit/internal/transport"
 )
+
+// mustParseURL is a helper for parsing URLs in tests
+func mustParseURL(rawURL string) *url.URL {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		panic("invalid test URL: " + rawURL)
+	}
+	return u
+}
 
 // TestAgent_JobProcessing tests the agent's ability to process jobs
 func TestAgent_JobProcessing(t *testing.T) {
@@ -100,7 +109,7 @@ func TestAgent_JobStatusUpdates(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatalf("Failed to parse response: %v", err)
 	}
@@ -228,12 +237,12 @@ func TestAgent_FileInfo(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatalf("Failed to parse response: %v", err)
 	}
 
-	fileInfo := response["file"].(map[string]interface{})
+	fileInfo := response["file"].(map[string]any)
 	if fileInfo["path"] != filePath {
 		t.Fatalf("Expected file path %s, got %v", filePath, fileInfo["path"])
 	}
@@ -262,12 +271,12 @@ func TestAgent_DatasetListing(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatalf("Failed to parse response: %v", err)
 	}
 
-	datasets := response["datasets"].([]interface{})
+	datasets := response["datasets"].([]any)
 	if len(datasets) < 2 {
 		t.Fatalf("Expected at least 2 datasets, got %d", len(datasets))
 	}
@@ -294,12 +303,12 @@ func TestAgent_FileListing(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatalf("Failed to parse response: %v", err)
 	}
 
-	files := response["files"].([]interface{})
+	files := response["files"].([]any)
 	if len(files) < 3 {
 		t.Fatalf("Expected at least 3 files, got %d", len(files))
 	}
@@ -318,7 +327,7 @@ func TestAgent_HealthCheck(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatalf("Failed to parse response: %v", err)
 	}
@@ -341,13 +350,13 @@ func TestAgent_StateReporting(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d", w.Code)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatalf("Failed to parse response: %v", err)
 	}
 
 	// Check that required fields are present
-	state := response["state"].(map[string]interface{})
+	state := response["state"].(map[string]any)
 	if _, exists := state["disk_available"]; !exists {
 		t.Fatal("Response missing disk_available field")
 	}
@@ -372,7 +381,7 @@ func TestAgent_DownloadWithPeerSource(t *testing.T) {
 			LocalPath: "/tmp/peer-test",
 			ProviderSource: types.ProviderSource{
 				ProviderID: "peer-main",
-				PeerAddr:   types.NewAddress("localhost", 8081),
+				PeerAddr:   mustParseURL("http://localhost:8081"),
 			},
 		},
 		Status: types.StatusPending,
@@ -396,8 +405,8 @@ func TestAgent_DownloadWithPeerSource(t *testing.T) {
 
 func createTestAgent(t *testing.T) *Agent {
 	// Create test cache
-	cacheConfig := config.CacheConfig{
-		RAMLimit:  types.Bytes(64 * 1024 * 1024), // 64MB for testing
+	cacheConfig := types.CacheConfig{
+		RAMLimit:  types.Bytes(10 * 1024 * 1024), // 10MB
 		DiskLimit: types.Bytes(0),                // Unlimited
 	}
 
@@ -406,33 +415,40 @@ func createTestAgent(t *testing.T) *Agent {
 		t.Fatalf("Failed to create test cache: %v", err)
 	}
 
+	// Register cleanup function to properly close the cache
+	t.Cleanup(func() {
+		if testCache != nil {
+			testCache.Close()
+		}
+	})
+
 	// Create test agent config
-	agentConfig := config.AgentConfig{
-		ID: "test-agent",
-		Storage: config.StorageConfig{
+	agentConfig := types.AgentConfig{
+		ID:                "test-agent",
+		ControllerURL:     mustParseURL("http://localhost:8080"),
+		ListenAddr:        mustParseURL("http://localhost:8081"),
+		AdvertiseAddr:     mustParseURL("http://localhost:8081"),
+		HeartbeatInterval: "30s",
+		Storage: types.StorageConfig{
 			BasePath: t.TempDir(),
 			Cache:    cacheConfig,
 		},
-		Network: config.NetworkConfig{
-			ListenAddr:        types.NewAddress("localhost", 8081),
-			AdvertiseAddr:     types.NewAddress("localhost", 8081),
-			HeartbeatInterval: "30s",
-			PeerTimeout:       "30s",
-		},
 	}
+
+	// Create test context
+	ctx := context.Background()
 
 	agent := &Agent{
 		cfg:            &agentConfig,
-		controllerAddr: types.NewAddress("localhost", 8080),
 		log:            logger.NewLogger(logger.WithName("test-agent")),
 		httpClient:     transport.NewHTTPTransfer(),
 		cache:          testCache,
 		jobs:           make(map[string]*types.Job),
 		jobCancelFuncs: make(map[string]context.CancelFunc),
+		ctx:            ctx, // Initialize ctx
 	}
 
 	// Initialize job pool for testing
-	ctx := context.Background()
 	agent.pool = runner.NewPool(ctx, "test-pool",
 		runner.WithPoolLogger(agent.log),
 		runner.WithPoolWorkers(1),

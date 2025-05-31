@@ -2,6 +2,7 @@ package types
 
 import (
 	"fmt"
+	"net/url"
 )
 
 // JobHandler represents the handler type for a job
@@ -13,8 +14,8 @@ const (
 
 // ProviderSource represents a single source for downloading a file (peer or upstream provider)
 type ProviderSource struct {
-	ProviderID string  `json:"provider_id"`         // ID of the provider to use
-	PeerAddr   Address `json:"peer_addr,omitempty"` // For peer providers, the agent address
+	ProviderID string   `json:"provider_id"`         // ID of the provider to use
+	PeerAddr   *url.URL `json:"peer_addr,omitempty"` // For peer providers, the agent address
 }
 
 // DistributionRequest specifies how a job should be distributed across agents

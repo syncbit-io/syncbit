@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"syncbit/internal/api"
@@ -24,18 +25,18 @@ const (
 // RegisterHandlers registers the handlers for the agent.
 func (a *Agent) RegisterHandlers(registrar api.HandlerRegistrar) error {
 	routes := []api.Route{
-		api.NewRoute(api.MethodGet, "/health", a.handleHealth),
-		api.NewRoute(api.MethodGet, "/state", a.handleGetState),
-		api.NewRoute(api.MethodGet, "/info", a.handleGetInfo),
-		api.NewRoute(api.MethodGet, "/cache/stats", a.handleGetCacheStats),
-		api.NewRoute(api.MethodGet, "/files/availability", a.handleGetFileAvailability),
-		api.NewRoute(api.MethodPost, "/jobs", a.handleSubmitJob),
-		api.NewRoute(api.MethodGet, "/jobs/{id}", a.handleGetJob),
-		api.NewRoute(api.MethodDelete, "/jobs/{id}", a.handleCancelJob),
-		api.NewRoute(api.MethodGet, "/datasets", a.handleListDatasets),
-		api.NewRoute(api.MethodGet, "/datasets/{name}/files", a.handleListFiles),
-		api.NewRoute(api.MethodGet, "/datasets/{name}/file-content/{path...}", a.handleGetFile),
-		api.NewRoute(api.MethodGet, "/datasets/{name}/file-info/{path...}", a.handleGetFileInfo),
+		api.NewRoute(http.MethodGet, "/health", a.handleHealth),
+		api.NewRoute(http.MethodGet, "/state", a.handleGetState),
+		api.NewRoute(http.MethodGet, "/info", a.handleGetInfo),
+		api.NewRoute(http.MethodGet, "/cache/stats", a.handleGetCacheStats),
+		api.NewRoute(http.MethodGet, "/files/availability", a.handleGetFileAvailability),
+		api.NewRoute(http.MethodPost, "/jobs", a.handleSubmitJob),
+		api.NewRoute(http.MethodGet, "/jobs/{id}", a.handleGetJob),
+		api.NewRoute(http.MethodDelete, "/jobs/{id}", a.handleCancelJob),
+		api.NewRoute(http.MethodGet, "/datasets", a.handleListDatasets),
+		api.NewRoute(http.MethodGet, "/datasets/{name}/files", a.handleListFiles),
+		api.NewRoute(http.MethodGet, "/datasets/{name}/file-content/{path...}", a.handleGetFile),
+		api.NewRoute(http.MethodGet, "/datasets/{name}/file-info/{path...}", a.handleGetFileInfo),
 	}
 
 	for _, route := range routes {
@@ -88,8 +89,8 @@ func (a *Agent) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	var payload response.JSON = make(response.JSON)
 	payload["agent_id"] = a.cfg.ID
 	payload["version"] = Version
-	payload["listen_addr"] = a.cfg.Network.ListenAddr.URL()
-	payload["advertise_addr"] = a.cfg.Network.AdvertiseAddr.URL()
+	payload["listen_addr"] = a.cfg.ListenAddr
+	payload["advertise_addr"] = a.cfg.AdvertiseAddr
 
 	response.Respond(w, response.WithJSON(payload))
 }
@@ -190,7 +191,7 @@ func (a *Agent) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Store the job context cancellation function
-	jobCtx, cancelFunc := context.WithCancel(context.Background())
+	jobCtx, cancelFunc := types.NewCancelableSubContext(a.ctx)
 	a.jobMutex.Lock()
 	a.jobCancelFuncs[job.ID] = cancelFunc
 	job.SetStatus(types.StatusRunning, "")
@@ -259,7 +260,7 @@ func (a *Agent) downloadFromProviderSource(ctx context.Context, rjob *runner.Job
 	}
 
 	// Handle peer providers differently (they need the peer address)
-	if providerSource.ProviderID == "peer-main" && (providerSource.PeerAddr != types.Address{}) {
+	if providerSource.ProviderID == "peer-main" && providerSource.PeerAddr != nil {
 		return a.downloadFromPeer(ctx, rjob, prov, providerSource.PeerAddr, datasetName, filePath)
 	}
 
@@ -268,7 +269,7 @@ func (a *Agent) downloadFromProviderSource(ctx context.Context, rjob *runner.Job
 }
 
 // downloadFromPeer downloads a file from a peer agent
-func (a *Agent) downloadFromPeer(ctx context.Context, rjob *runner.Job, prov provider.Provider, peerAddr types.Address, datasetName, filePath string) error {
+func (a *Agent) downloadFromPeer(ctx context.Context, rjob *runner.Job, prov provider.Provider, peerAddr *url.URL, datasetName, filePath string) error {
 	peerProv, ok := prov.(*provider.PeerProvider)
 	if !ok {
 		return fmt.Errorf("provider is not a peer provider")
@@ -284,7 +285,7 @@ func (a *Agent) downloadFromPeer(ctx context.Context, rjob *runner.Job, prov pro
 	}
 
 	// Download the file from peer
-	fileURL := fmt.Sprintf("%s/datasets/%s/files/%s", peerAddr.URL(), datasetName, filePath)
+	fileURL := fmt.Sprintf("%s/datasets/%s/files/%s", peerAddr.String(), datasetName, filePath)
 
 	httpTransfer := transport.NewHTTPTransfer(
 		transport.HTTPWithClient(transport.DefaultHTTPClient()),
@@ -403,7 +404,7 @@ func (a *Agent) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Report cancellation to controller
-	go a.reportJobStatus(context.Background(), job)
+	go a.reportJobStatus(r.Context(), job)
 
 	var payload response.JSON = make(response.JSON)
 	payload["message"] = "Job cancellation initiated"
@@ -419,9 +420,9 @@ func (a *Agent) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) handleListDatasets(w http.ResponseWriter, r *http.Request) {
 	datasets := a.cache.ListDatasets()
 
-	datasetList := make([]interface{}, len(datasets))
+	datasetList := make([]any, len(datasets))
 	for i, name := range datasets {
-		datasetList[i] = map[string]interface{}{
+		datasetList[i] = map[string]any{
 			"name": name,
 		}
 	}
@@ -445,9 +446,9 @@ func (a *Agent) handleListFiles(w http.ResponseWriter, r *http.Request) {
 
 	files := a.cache.ListFiles(datasetName)
 
-	fileList := make([]interface{}, len(files))
+	fileList := make([]any, len(files))
 	for i, path := range files {
-		fileList[i] = map[string]interface{}{
+		fileList[i] = map[string]any{
 			"path": path,
 		}
 	}
@@ -534,8 +535,8 @@ func (a *Agent) handleGetFileInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create response with file information
-	response := map[string]interface{}{
-		"file": map[string]interface{}{
+	response := map[string]any{
+		"file": map[string]any{
 			"path": filePath,
 			"size": len(data),
 		},
@@ -591,6 +592,11 @@ func (a *Agent) downloadFromHFProvider(ctx context.Context, rjob *runner.Job, hf
 
 // storeStreamInCache delegates stream storage to the cache system
 func (a *Agent) storeStreamInCache(ctx context.Context, rjob *runner.Job, datasetName, filePath string, reader io.Reader, fileSize types.Bytes) error {
+	return a.storeStreamInCacheWithMetadata(ctx, rjob, datasetName, filePath, reader, fileSize, nil)
+}
+
+// storeStreamInCacheWithMetadata delegates stream storage to the cache system with optional source metadata
+func (a *Agent) storeStreamInCacheWithMetadata(ctx context.Context, rjob *runner.Job, datasetName, filePath string, reader io.Reader, fileSize types.Bytes, sourceInfo *types.FileInfo) error {
 	// Create a cache-backed writer with progress tracking
 	rw := a.cache.NewCacheWriter(datasetName, filePath, fileSize,
 		types.RWWithIOReader(reader),
@@ -606,7 +612,19 @@ func (a *Agent) storeStreamInCache(ctx context.Context, rjob *runner.Job, datase
 	}
 
 	// Close the writer to ensure write-through to disk
-	return rw.CloseWriter()
+	if err := rw.CloseWriter(); err != nil {
+		return fmt.Errorf("failed to close cache writer: %w", err)
+	}
+
+	// Update file metadata with source information if available
+	if sourceInfo != nil {
+		if err := a.cache.UpdateFileMetadata(datasetName, filePath, sourceInfo); err != nil {
+			a.log.Warn("Failed to update file metadata", "error", err)
+			// Don't fail the operation, just log the warning
+		}
+	}
+
+	return nil
 }
 
 // handleGetFileAvailability returns information about what files this agent has available

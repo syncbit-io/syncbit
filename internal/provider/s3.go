@@ -3,7 +3,6 @@ package provider
 import (
 	"context"
 
-	"syncbit/internal/config"
 	"syncbit/internal/core/types"
 	"syncbit/internal/transport"
 
@@ -16,14 +15,14 @@ import (
 // Provides authentication and connection services for S3 access
 type S3Provider struct {
 	id       string
-	cfg      *config.ProviderConfig
+	cfg      *types.ProviderConfig
 	session  *session.Session
 	s3Client *s3.S3
 	transfer *transport.S3Transfer
 }
 
 // NewS3Provider creates a new S3 provider
-func NewS3Provider(cfg config.ProviderConfig, transferCfg config.TransferConfig) (Provider, error) {
+func NewS3Provider(cfg types.ProviderConfig, transferCfg types.TransferConfig) (Provider, error) {
 	// Create AWS session
 	var sess *session.Session
 	var err error
@@ -55,7 +54,7 @@ func NewS3Provider(cfg config.ProviderConfig, transferCfg config.TransferConfig)
 	}
 
 	s3Client := s3.New(sess)
-	transfer, err := transport.NewS3Transfer(s3Client, sess)
+	transfer, err := transport.NewS3Transfer(s3Client, sess, transferCfg)
 	if err != nil {
 		return nil, err
 	}

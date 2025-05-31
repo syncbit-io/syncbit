@@ -1,125 +1,220 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+
 	"syncbit/internal/core/types"
-	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
-// DaemonConfig holds configuration for the agent daemon
-type DaemonConfig struct {
-	Debug          bool                      `yaml:"debug"`
-	AgentAddr      types.Address             `yaml:"agent_addr"`      // Address for agent API
-	ControllerAddr types.Address             `yaml:"controller_addr"` // Address for controller API
-	Providers      map[string]ProviderConfig `yaml:"providers"`       // Named provider configurations
-	// Add more daemon config fields as needed
-}
-
-// AgentConfig holds configuration for agent-specific settings
-type AgentConfig struct {
-	ID      string        `yaml:"id"`      // Agent identifier
-	Storage StorageConfig `yaml:"storage"` // Storage and cache settings
-	Network NetworkConfig `yaml:"network"` // Network and peer settings
-}
-
-// StorageConfig holds storage and caching configuration
-type StorageConfig struct {
-	BasePath string      `yaml:"base_path"` // Base directory for all datasets
-	Cache    CacheConfig `yaml:"cache"`     // Cache configuration
-}
-
-// CacheConfig holds cache-specific settings
-type CacheConfig struct {
-	RAMLimit  types.Bytes `yaml:"ram_limit"`  // Maximum RAM for file cache
-	DiskLimit types.Bytes `yaml:"disk_limit"` // Maximum disk usage (0 = unlimited)
-}
-
-// NetworkConfig holds network and peer communication settings
-type NetworkConfig struct {
-	ListenAddr        types.Address `yaml:"listen_addr"`        // Address to bind agent API
-	AdvertiseAddr     types.Address `yaml:"advertise_addr"`     // Address for other agents to reach this one
-	HeartbeatInterval string        `yaml:"heartbeat_interval"` // How often to report to controller
-	PeerTimeout       string        `yaml:"peer_timeout"`       // Timeout for peer requests
-}
-
-// ClientConfig holds configuration for the client
-type ClientConfig struct {
-	ControllerAddr types.Address `yaml:"controller_addr"` // Address for controller API
-	// Add more client config fields as needed
-}
-
-// ProviderConfig holds authentication and connection configuration for a provider
-// Resource identifiers (repo, bucket, URL) are specified at the job level
-type ProviderConfig struct {
-	ID   string `yaml:"id"`   // Unique identifier for this provider instance
-	Type string `yaml:"type"` // Provider type (s3, hf, http)
-	Name string `yaml:"name"` // Human-readable name
-
-	// Authentication settings
-	Token string `yaml:"token"` // Auth token (HF token, API key, etc.)
-
-	// AWS S3 specific settings
-	Region  string `yaml:"region"`  // AWS region (optional, can be job-specific)
-	Profile string `yaml:"profile"` // AWS profile
-
-	// HTTP specific settings
-	Headers map[string]string `yaml:"headers"` // Default headers for HTTP requests
-}
-
-// TransferConfig holds configuration for transfer settings
-type TransferConfig struct {
-	RateLimit   int64             `yaml:"rate_limit"`  // Bytes per second rate limit
-	PartSize    int64             `yaml:"part_size"`   // Part size for multipart downloads
-	Concurrency int               `yaml:"concurrency"` // Number of concurrent parts
-	Headers     map[string]string `yaml:"headers"`     // HTTP headers
-}
-
-// DefaultTransferConfig returns default transfer configuration
-func DefaultTransferConfig() TransferConfig {
-	return TransferConfig{
-		RateLimit:   0,               // No limit
-		PartSize:    5 * 1024 * 1024, // 5MB
-		Concurrency: 4,
-		Headers:     make(map[string]string),
+// LoadConfig loads configuration from a YAML file and applies defaults
+func LoadConfig(configFile string) (*types.Config, error) {
+	// Start with default configuration
+	config := &types.Config{
+		Debug:     false,
+		Providers: make(map[string]types.ProviderConfig),
 	}
+
+	// Load from file if it exists
+	if configFile != "" && fileExists(configFile) {
+		data, err := os.ReadFile(configFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config file %s: %w", configFile, err)
+		}
+
+		if err := yaml.Unmarshal(data, config); err != nil {
+			return nil, fmt.Errorf("failed to parse config file %s: %w", configFile, err)
+		}
+	}
+
+	// Apply defaults by merging with default configs
+	if config.Agent != nil {
+		config.Agent = mergeAgentConfig(config.Agent, types.DefaultAgentConfig())
+	}
+	if config.Controller != nil {
+		config.Controller = mergeControllerConfig(config.Controller, types.DefaultControllerConfig())
+	}
+	if config.Client != nil {
+		config.Client = mergeClientConfig(config.Client, types.DefaultClientConfig())
+	}
+
+	return config, nil
 }
 
-// ParseDuration parses a duration string with fallback to default
-func (n *NetworkConfig) ParseHeartbeatInterval(defaultDuration time.Duration) time.Duration {
-	if n.HeartbeatInterval == "" {
-		return defaultDuration
-	}
-	if dur, err := time.ParseDuration(n.HeartbeatInterval); err == nil {
-		return dur
-	}
-	return defaultDuration
-}
-
-// ParsePeerTimeout parses peer timeout with fallback to default
-func (n *NetworkConfig) ParsePeerTimeout(defaultDuration time.Duration) time.Duration {
-	if n.PeerTimeout == "" {
-		return defaultDuration
-	}
-	if dur, err := time.ParseDuration(n.PeerTimeout); err == nil {
-		return dur
-	}
-	return defaultDuration
-}
-
-// DefaultAgentConfig returns default agent configuration
-func DefaultAgentConfig() AgentConfig {
-	return AgentConfig{
-		Storage: StorageConfig{
-			BasePath: "/var/lib/syncbit/data",
-			Cache: CacheConfig{
-				RAMLimit:  types.Bytes(4 * 1024 * 1024 * 1024), // 4GB
-				DiskLimit: types.Bytes(0),                      // Unlimited
+// mergeAgentConfig merges loaded config with defaults, with loaded values taking precedence
+func mergeAgentConfig(loaded *types.AgentConfig, defaults types.AgentConfig) *types.AgentConfig {
+	// Create result from defaults using struct literals for clarity
+	result := types.AgentConfig{
+		ID:                coalesce(loaded.ID, defaults.ID),
+		ControllerURL:     coalescePtr(loaded.ControllerURL, defaults.ControllerURL),
+		ListenAddr:        coalescePtr(loaded.ListenAddr, defaults.ListenAddr),
+		AdvertiseAddr:     coalescePtr(loaded.AdvertiseAddr, defaults.AdvertiseAddr),
+		HeartbeatInterval: coalesce(loaded.HeartbeatInterval, defaults.HeartbeatInterval),
+		Storage: types.StorageConfig{
+			BasePath: coalesce(loaded.Storage.BasePath, defaults.Storage.BasePath),
+			Cache: types.CacheConfig{
+				RAMLimit:  coalesceBytes(loaded.Storage.Cache.RAMLimit, defaults.Storage.Cache.RAMLimit),
+				DiskLimit: coalesceBytes(loaded.Storage.Cache.DiskLimit, defaults.Storage.Cache.DiskLimit),
 			},
 		},
-		Network: NetworkConfig{
-			ListenAddr:        types.NewAddress("0.0.0.0", 8081),
-			AdvertiseAddr:     types.Address{}, // Empty, will be auto-detected
-			HeartbeatInterval: "30s",
-			PeerTimeout:       "30s",
+	}
+
+	// Auto-detect advertise address if not explicitly set
+	if result.AdvertiseAddr == nil && result.ListenAddr != nil {
+		result.AdvertiseAddr = autoDetectAdvertiseAddr(result.ListenAddr)
+	}
+
+	return &result
+}
+
+// Helper functions to reduce repetitive conditional logic
+func coalesce[T comparable](loaded, defaultVal T) T {
+	var zero T
+	if loaded != zero {
+		return loaded
+	}
+	return defaultVal
+}
+
+func coalescePtr[T any](loaded, defaultVal *T) *T {
+	if loaded != nil {
+		return loaded
+	}
+	return defaultVal
+}
+
+func coalesceBytes(loaded, defaultVal types.Bytes) types.Bytes {
+	if loaded != 0 {
+		return loaded
+	}
+	return defaultVal
+}
+
+// autoDetectAdvertiseAddr derives advertise address from listen address
+func autoDetectAdvertiseAddr(listenAddr *url.URL) *url.URL {
+	host := listenAddr.Hostname()
+	port := listenAddr.Port()
+	if host == "0.0.0.0" {
+		host = "localhost"
+	}
+	return &url.URL{
+		Scheme: listenAddr.Scheme,
+		Host:   fmt.Sprintf("%s:%s", host, port),
+	}
+}
+
+// mergeControllerConfig merges loaded config with defaults
+func mergeControllerConfig(loaded *types.ControllerConfig, defaults types.ControllerConfig) *types.ControllerConfig {
+	return &types.ControllerConfig{
+		ListenAddr:   coalescePtr(loaded.ListenAddr, defaults.ListenAddr),
+		AgentTimeout: coalesce(loaded.AgentTimeout, defaults.AgentTimeout),
+		SyncInterval: coalesce(loaded.SyncInterval, defaults.SyncInterval),
+	}
+}
+
+// mergeClientConfig merges loaded config with defaults
+func mergeClientConfig(loaded *types.ClientConfig, defaults types.ClientConfig) *types.ClientConfig {
+	return &types.ClientConfig{
+		ControllerURL: coalescePtr(loaded.ControllerURL, defaults.ControllerURL),
+	}
+}
+
+// fileExists checks if a file exists
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return !info.IsDir()
+}
+
+// ValidateProviders validates provider configurations using struct literal validation rules
+func ValidateProviders(providers map[string]types.ProviderConfig) error {
+	// Define validation rules as struct literals
+	validationRules := struct {
+		supportedTypes map[string]bool
+		requiredFields map[string][]string
+	}{
+		supportedTypes: map[string]bool{
+			"hf":   true,
+			"s3":   true,
+			"http": true,
+			"peer": true,
+		},
+		requiredFields: map[string][]string{
+			"hf":   {"type"},
+			"s3":   {"type"},
+			"http": {"type"},
+			"peer": {"type"},
 		},
 	}
+
+	for id, cfg := range providers {
+		// Validate provider type
+		if !validationRules.supportedTypes[cfg.Type] {
+			return fmt.Errorf("unsupported provider type '%s' for provider '%s'", cfg.Type, id)
+		}
+
+		// Validate required fields
+		if requiredFields, exists := validationRules.requiredFields[cfg.Type]; exists {
+			for _, field := range requiredFields {
+				switch field {
+				case "type":
+					if cfg.Type == "" {
+						return fmt.Errorf("provider '%s' missing required field: %s", id, field)
+					}
+				}
+			}
+		}
+
+		// Validate ID consistency
+		if cfg.ID != "" && cfg.ID != id {
+			return fmt.Errorf("provider ID '%s' doesn't match key '%s'", cfg.ID, id)
+		}
+
+		// Set ID if not specified
+		if cfg.ID == "" {
+			cfg.ID = id
+		}
+
+		// Apply default transfer config if not specified
+		if cfg.Transfer == nil {
+			defaultTransfer := types.DefaultTransferConfig()
+			cfg.Transfer = &defaultTransfer
+		}
+
+		// Update the provider in the map with any modifications
+		providers[id] = cfg
+	}
+
+	return nil
+}
+
+// ResolveConfigPath resolves a config file path, checking common locations
+func ResolveConfigPath(configFile string) string {
+	if configFile != "" {
+		if filepath.IsAbs(configFile) || fileExists(configFile) {
+			return configFile
+		}
+	}
+
+	// Define common paths as struct literal
+	commonPaths := []string{
+		"config.yaml",
+		"config.yml",
+		"/etc/syncbit/config.yaml",
+		"/etc/syncbit/config.yml",
+	}
+
+	for _, path := range commonPaths {
+		if fileExists(path) {
+			return path
+		}
+	}
+
+	return configFile // Return original even if it doesn't exist
 }

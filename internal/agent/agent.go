@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -20,9 +21,8 @@ import (
 )
 
 type Agent struct {
-	cfg            *config.AgentConfig
-	daemonCfg      *config.DaemonConfig
-	controllerAddr types.Address
+	cfg            *types.AgentConfig
+	providers      map[string]types.ProviderConfig
 	log            *logger.Logger
 	httpClient     *transport.HTTPTransfer
 	server         *api.Server
@@ -31,6 +31,7 @@ type Agent struct {
 	jobs           map[string]*types.Job
 	jobCancelFuncs map[string]context.CancelFunc
 	jobMutex       sync.RWMutex
+	ctx            context.Context // Main app context for proper cancellation
 }
 
 type AgentOption func(*Agent)
@@ -48,88 +49,65 @@ func WithServer(server *api.Server) AgentOption {
 }
 
 func NewAgent(configFile string, debug bool, opts ...AgentOption) *Agent {
-	// Create a structure to load the complete configuration file
-	type AgentConfigFile struct {
-		Daemon config.DaemonConfig `yaml:"daemon"`
-		Agent  config.AgentConfig  `yaml:"agent"`
-	}
-
-	// Load the complete configuration file
-	configData := &AgentConfigFile{}
-	config.LoadYAMLWithDefaults(configFile, configData)
-
-	// Extract daemon and agent configs
-	daemonCfg := &configData.Daemon
-	agentCfg := configData.Agent
-
-	// Apply defaults if agent config is missing or incomplete
-	if agentCfg.ID == "" {
-		if hostname, err := os.Hostname(); err == nil {
-			agentCfg.ID = fmt.Sprintf("agent-%s", hostname)
-		} else {
-			agentCfg.ID = fmt.Sprintf("agent-%d", time.Now().Unix())
+	// Load configuration
+	cfg, err := config.LoadConfig(configFile)
+	if err != nil {
+		// Use defaults if config load fails
+		cfg = &types.Config{
+			Debug:     debug,
+			Providers: make(map[string]types.ProviderConfig),
+			Agent:     &types.AgentConfig{},
 		}
-	}
-
-	// Apply defaults for storage if not set
-	if agentCfg.Storage.BasePath == "" {
-		agentCfg.Storage.BasePath = "/var/lib/syncbit/data"
-	}
-
-	// Apply defaults for cache if not set
-	if agentCfg.Storage.Cache.RAMLimit == 0 {
-		agentCfg.Storage.Cache.RAMLimit = types.Bytes(4 * 1024 * 1024 * 1024) // 4GB
-	}
-
-	// Apply defaults for network if not set
-	if (agentCfg.Network.ListenAddr == types.Address{}) {
-		agentCfg.Network.ListenAddr = types.NewAddress("0.0.0.0", 8081)
-	}
-
-	// Apply defaults for heartbeat interval
-	if agentCfg.Network.HeartbeatInterval == "" {
-		agentCfg.Network.HeartbeatInterval = "30s"
-	}
-
-	// Apply defaults for peer timeout
-	if agentCfg.Network.PeerTimeout == "" {
-		agentCfg.Network.PeerTimeout = "30s"
-	}
-
-	// Auto-detect advertise address if not set
-	if (agentCfg.Network.AdvertiseAddr == types.Address{}) {
-		advertiseAddr := agentCfg.Network.ListenAddr
-		if advertiseAddr.Host == "0.0.0.0" {
-			advertiseAddr.Host = "localhost"
-		}
-		agentCfg.Network.AdvertiseAddr = advertiseAddr
 	}
 
 	// Apply debug flag
 	if debug {
-		daemonCfg.Debug = true
+		cfg.Debug = true
 	}
 
-	// Use controller address from daemon config
-	controllerAddr := daemonCfg.ControllerAddr
+	// Ensure we have agent config
+	if cfg.Agent == nil {
+		defaults := types.DefaultAgentConfig()
+		cfg.Agent = &defaults
+	}
+
+	// Auto-generate agent ID if not set
+	if cfg.Agent.ID == "" {
+		if hostname, err := os.Hostname(); err == nil {
+			cfg.Agent.ID = fmt.Sprintf("agent-%s", hostname)
+		} else {
+			cfg.Agent.ID = fmt.Sprintf("agent-%d", time.Now().Unix())
+		}
+	}
+
+	// Use advertise address from config, or default to localhost
+	advertiseAddr := cfg.Agent.AdvertiseAddr
+	if advertiseAddr == nil {
+		advertiseAddr, _ = url.Parse("http://localhost:8081")
+	}
+
+	// Use listen address from config, or default
+	listenAddr := cfg.Agent.ListenAddr
+	if listenAddr == nil {
+		listenAddr, _ = url.Parse("http://0.0.0.0:8081")
+	}
 
 	// Create HTTP client for agent-controller communication
 	httpClient := transport.NewHTTPTransfer()
 
 	// Initialize cache
-	agentCache, err := cache.NewCache(agentCfg.Storage.Cache, agentCfg.Storage.BasePath)
+	agentCache, err := cache.NewCache(cfg.Agent.Storage.Cache, cfg.Agent.Storage.BasePath)
 	if err != nil {
 		// Continue with memory-only cache on error
-		agentCache, _ = cache.NewCache(agentCfg.Storage.Cache, "")
+		agentCache, _ = cache.NewCache(cfg.Agent.Storage.Cache, "")
 	}
 
 	a := &Agent{
-		cfg:            &agentCfg,
-		daemonCfg:      daemonCfg,
-		controllerAddr: controllerAddr,
+		cfg:            cfg.Agent,
+		providers:      cfg.Providers,
 		log:            logger.NewLogger(logger.WithName("agent")),
 		httpClient:     httpClient,
-		server:         api.NewServer(api.WithListen(agentCfg.Network.ListenAddr)),
+		server:         api.NewServer(api.WithListen(listenAddr)),
 		cache:          agentCache,
 		jobs:           make(map[string]*types.Job),
 		jobCancelFuncs: make(map[string]context.CancelFunc),
@@ -143,19 +121,22 @@ func NewAgent(configFile string, debug bool, opts ...AgentOption) *Agent {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
+	// Store the main app context for use in job management
+	a.ctx = ctx
+
 	a.log.Info("Starting agent",
-		"controller", a.controllerAddr.URL(),
+		"controller", a.cfg.ControllerURL,
 		"agent_id", a.cfg.ID,
-		"listen", a.cfg.Network.ListenAddr.URL(),
-		"advertise", a.cfg.Network.AdvertiseAddr.URL(),
+		"listen", a.cfg.ListenAddr,
+		"advertise", a.cfg.AdvertiseAddr,
 	)
 
-	// Initialize providers from daemon config
-	if err := provider.InitFromDaemonConfig(*a.daemonCfg); err != nil {
+	// Initialize providers from config
+	if err := a.initProviders(); err != nil {
 		a.log.Error("Failed to initialize providers", "error", err)
 		return fmt.Errorf("failed to initialize providers: %w", err)
 	}
-	a.log.Info("Providers initialized successfully", "count", len(provider.ListProviders()))
+	a.log.Info("Providers initialized successfully", "count", len(a.providers))
 
 	// Initialize job pool
 	a.pool = runner.NewPool(ctx, "agent-jobs",
@@ -179,12 +160,17 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	// Start heartbeat goroutine
-	heartbeatInterval := a.cfg.Network.ParseHeartbeatInterval(30 * time.Second)
+	heartbeatInterval := types.ParseDuration(a.cfg.HeartbeatInterval, 30*time.Second)
 	go a.heartbeatLoop(ctx, heartbeatInterval)
 
 	// Start the agent API server
-	a.log.Info("Starting agent API server", "address", a.cfg.Network.ListenAddr.URL())
+	a.log.Info("Starting agent API server", "address", a.cfg.ListenAddr)
 	return a.server.Run(ctx)
+}
+
+// initProviders initializes providers from configuration
+func (a *Agent) initProviders() error {
+	return provider.InitializeProviders(a.providers)
 }
 
 // processJobs handles completed jobs from the pool and reports status back to controller
@@ -250,7 +236,7 @@ func (a *Agent) reportJobStatus(ctx context.Context, job *types.Job) {
 		Error:  job.Error,
 	}
 
-	url := fmt.Sprintf("%s/jobs/%s/status", a.controllerAddr.URL(), job.ID)
+	url := fmt.Sprintf("%s/jobs/%s/status", a.cfg.ControllerURL, job.ID)
 
 	err := a.httpClient.Post(ctx, url, func(resp *http.Response) error {
 		defer resp.Body.Close()
@@ -273,10 +259,10 @@ func (a *Agent) registerWithController(ctx context.Context) error {
 		AdvertiseAddr string `json:"advertise_addr"`
 	}{
 		ID:            a.cfg.ID,
-		AdvertiseAddr: a.cfg.Network.AdvertiseAddr.URL(),
+		AdvertiseAddr: a.cfg.AdvertiseAddr.String(),
 	}
 
-	url := fmt.Sprintf("%s/agents/register", a.controllerAddr.URL())
+	url := fmt.Sprintf("%s/agents/register", a.cfg.ControllerURL.String())
 
 	err := a.httpClient.Post(ctx, url, func(resp *http.Response) error {
 		defer resp.Body.Close()
@@ -330,7 +316,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) error {
 		LastUpdated:   time.Now(),
 	}
 
-	url := fmt.Sprintf("%s/agents/%s/heartbeat", a.controllerAddr.URL(), a.cfg.ID)
+	url := fmt.Sprintf("%s/agents/%s/heartbeat", a.cfg.ControllerURL, a.cfg.ID)
 
 	err := a.httpClient.Post(ctx, url, func(resp *http.Response) error {
 		defer resp.Body.Close()

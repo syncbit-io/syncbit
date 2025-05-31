@@ -127,7 +127,7 @@ func (js *JobScheduler) ScheduleJob(ctx context.Context, job *types.Job) error {
 	}
 
 	// Assign the job to the selected agent
-	return js.AssignJobToAgent(job, targetAgent)
+	return js.AssignJobToAgent(ctx, job, targetAgent)
 }
 
 // selectBestAgent chooses the optimal agent for a download job
@@ -222,11 +222,10 @@ func (js *JobScheduler) calculateAgentScore(agent *types.Agent, job *types.Job, 
 }
 
 // AssignJobToAgent assigns a job to a specific agent
-func (js *JobScheduler) AssignJobToAgent(job *types.Job, agent *types.Agent) error {
+func (js *JobScheduler) AssignJobToAgent(ctx context.Context, job *types.Job, agent *types.Agent) error {
 	// Send the job to the agent via HTTP
-	agentURL := fmt.Sprintf("%s/jobs", agent.AdvertiseAddr.URL())
+	agentURL := fmt.Sprintf("%s/jobs", agent.AdvertiseAddr.String())
 
-	ctx := context.Background()
 	if err := js.sendJobToAgent(ctx, agentURL, job); err != nil {
 		return fmt.Errorf("failed to send job to agent %s: %w", agent.ID, err)
 	}

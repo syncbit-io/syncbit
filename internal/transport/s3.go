@@ -17,21 +17,29 @@ import (
 
 // S3Provider implements the Provider interface for AWS S3
 type S3Transfer struct {
-	// cfg      core.TransferConfig
+	cfg      types.TransferConfig
 	session  *session.Session
 	s3Client *s3.S3
 	limiter  *types.RateLimiter
 }
 
 // NewS3Transfer creates a new S3 transfer instance
-// func NewS3Transfer(s3Client *s3.S3, s3Session *session.Session, cfg core.TransferConfig, displayName string) (*S3Transfer, error) {
-func NewS3Transfer(s3Client *s3.S3, s3Session *session.Session) (*S3Transfer, error) {
+func NewS3Transfer(s3Client *s3.S3, s3Session *session.Session, cfg types.TransferConfig) (*S3Transfer, error) {
+	// Create rate limiter based on transfer config
+	var limiter *types.RateLimiter
+	if cfg.RateLimit > 0 {
+		// Use configured rate limit
+		limiter = types.NewRateLimiter(types.Bytes(cfg.RateLimit))
+	} else {
+		// No rate limit configured, use default
+		limiter = types.DefaultRateLimiter()
+	}
+
 	return &S3Transfer{
-		// cfg:      cfg,
+		cfg:      cfg,
 		session:  s3Session,
 		s3Client: s3Client,
-		limiter:  types.DefaultRateLimiter(),
-		// limiter:  NewRateLimiter(cfg.RateLimit, cfg.PartSize, cfg.Concurrency),
+		limiter:  limiter,
 	}, nil
 }
 

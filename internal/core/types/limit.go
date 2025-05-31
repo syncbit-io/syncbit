@@ -16,10 +16,11 @@ type RateLimiter struct {
 }
 
 func DefaultRateLimiter() *RateLimiter {
-	return NewRateLimiter(DefaultRateLimit, DefaultRateBurst, DefaultConcurrency)
+	return NewRateLimiter(DefaultRateLimit)
 }
 
-func NewRateLimiter(rateLimit, rateBurst Bytes, concurrency int) *RateLimiter {
+// NewRateLimiter creates a rate limiter with intelligent burst size calculation
+func NewRateLimiter(rateLimit Bytes) *RateLimiter {
 	rateInt := rateLimit.Bytes()
 
 	// If rate is 0, create an unlimited rate limiter
@@ -27,15 +28,17 @@ func NewRateLimiter(rateLimit, rateBurst Bytes, concurrency int) *RateLimiter {
 		return &RateLimiter{rate.NewLimiter(rate.Inf, 0)}
 	}
 
-	// Use rateBurst * concurrency as the burst size
-	burstSize := int(rateBurst.Bytes()) * concurrency
-
-	// Ensure burst is at least 1 byte and no more than rateInt/10
-	if burstSize > int(rateInt/10) && rateInt > 0 {
-		burstSize = int(rateInt / 10)
+	// Calculate intelligent burst size: 1% of rate limit with reasonable bounds
+	burstSize := int(rateInt / 100)
+	
+	// Minimum burst of 64KB for small rate limits
+	if burstSize < 64*1024 {
+		burstSize = 64 * 1024
 	}
-	if burstSize < 1 {
-		burstSize = 1
+	
+	// Maximum burst of 10MB for very high rate limits
+	if burstSize > 10*1024*1024 {
+		burstSize = 10 * 1024 * 1024
 	}
 
 	return &RateLimiter{rate.NewLimiter(rate.Limit(rateInt), burstSize)}

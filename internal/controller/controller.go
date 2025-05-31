@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -18,15 +19,6 @@ import (
 	"syncbit/internal/runner"
 	"syncbit/internal/transport"
 )
-
-type Config struct {
-	Listen types.Address `yaml:"listen"` // Address to bind controller API
-	Debug  bool          `yaml:"debug"`
-	Cache  struct {
-		Enabled bool   `yaml:"enabled"`  // Enable cache awareness
-		BaseDir string `yaml:"base_dir"` // Base directory for cache metadata
-	} `yaml:"cache"`
-}
 
 type ControllerOption func(*Controller)
 
@@ -53,7 +45,7 @@ func WithCache(cache *cache.Cache) ControllerOption {
 
 // Controller is the main controller for the application.
 type Controller struct {
-	cfg          *Config
+	cfg          *types.ControllerConfig
 	logger       *logger.Logger
 	server       *api.Server
 	pool         *runner.Pool
@@ -74,22 +66,37 @@ type Controller struct {
 
 // NewController creates a new controller with the given options.
 func NewController(configFile string, debug bool, opts ...ControllerOption) *Controller {
-	cfg := &Config{
-		Listen: types.NewAddress("0.0.0.0", 8080), // Default listen address
-		Debug:  false,
+	// Load configuration
+	cfg, err := config.LoadConfig(configFile)
+	if err != nil {
+		// Use defaults if config load fails
+		cfg = &types.Config{
+			Debug:      debug,
+			Controller: &types.ControllerConfig{},
+		}
 	}
 
-	// Load configuration with defaults
-	config.LoadYAMLWithDefaults(configFile, cfg)
-
+	// Apply debug flag
 	if debug {
 		cfg.Debug = true
 	}
 
+	// Ensure we have controller config
+	if cfg.Controller == nil {
+		defaults := types.DefaultControllerConfig()
+		cfg.Controller = &defaults
+	}
+
+	// Use listen address from config, or default
+	listenAddr := cfg.Controller.ListenAddr
+	if listenAddr == nil {
+		listenAddr, _ = url.Parse("http://0.0.0.0:8080")
+	}
+
 	c := &Controller{
 		logger:       logger.NewLogger(logger.WithName("controller")),
-		server:       api.NewServer(api.WithListen(cfg.Listen)),
-		cfg:          cfg,
+		server:       api.NewServer(api.WithListen(listenAddr)),
+		cfg:          cfg.Controller,
 		httpTransfer: transport.NewHTTPTransfer(),
 		jobs:         make(map[string]*types.Job),
 		agents:       make(map[string]*types.Agent),
@@ -106,11 +113,10 @@ func NewController(configFile string, debug bool, opts ...ControllerOption) *Con
 }
 
 // SubmitJob adds a new job to the controller
-func (c *Controller) SubmitJob(job *types.Job) error {
+func (c *Controller) SubmitJob(ctx context.Context, job *types.Job) error {
 	job.SetStatus(types.StatusPending, "")
 
 	// Use scheduler to intelligently assign the job
-	ctx := context.Background()
 	if err := c.scheduler.ScheduleJob(ctx, job); err != nil {
 		c.logger.Error("Failed to schedule job", "job_id", job.ID, "error", err)
 		job.SetStatus(types.StatusFailed, fmt.Sprintf("scheduling failed: %v", err))
@@ -149,9 +155,7 @@ func (c *Controller) SubmitJob(job *types.Job) error {
 }
 
 // SubmitDownload schedules downloads for multiple files from a repository
-func (c *Controller) SubmitDownload(repo, revision string, files []string, providerID, localPath string) ([]*types.Job, error) {
-	ctx := context.Background()
-
+func (c *Controller) SubmitDownload(ctx context.Context, repo, revision string, files []string, providerID, localPath string) ([]*types.Job, error) {
 	// Use scheduler to create and assign individual jobs per file
 	jobs, err := c.scheduler.ScheduleDownload(ctx, repo, revision, files, providerID, localPath)
 	if err != nil {
@@ -164,9 +168,7 @@ func (c *Controller) SubmitDownload(repo, revision string, files []string, provi
 }
 
 // SubmitDistributedDownload schedules downloads with specific distribution requirements
-func (c *Controller) SubmitDistributedDownload(repo, revision string, files []string, providerID, localPath string, distribution types.DistributionRequest) ([]*types.Job, error) {
-	ctx := context.Background()
-
+func (c *Controller) SubmitDistributedDownload(ctx context.Context, repo, revision string, files []string, providerID, localPath string, distribution types.DistributionRequest) ([]*types.Job, error) {
 	// Use scheduler to create and assign jobs with distribution requirements
 	jobs, err := c.scheduler.ScheduleDistributedDownload(ctx, repo, revision, files, providerID, localPath, distribution)
 	if err != nil {
@@ -192,7 +194,7 @@ func (c *Controller) GetJob(jobID string) (*types.Job, bool) {
 }
 
 // GetNextJob retrieves the next job from available pending jobs
-func (c *Controller) GetNextJob(ctx context.Context) (*types.Job, error) {
+func (c *Controller) GetNextJob() (*types.Job, error) {
 	c.jobMutex.Lock()
 	defer c.jobMutex.Unlock()
 
@@ -276,7 +278,7 @@ func (c *Controller) cleanupLoop(ctx context.Context) {
 
 // reconciliationLoop runs periodic reconciliation tasks
 func (c *Controller) reconciliationLoop(ctx context.Context) {
-	ticker := time.NewTicker(60 * time.Second) // Reconciliation every minute
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -446,7 +448,7 @@ func (c *Controller) reconcileFileDistribution(ctx context.Context, state *Clust
 		}
 
 		// Create a job for this agent to get this file
-		job := c.createJobForFile(fileKey, targetAgent, state, distribution)
+		job := c.createJobForFile(ctx, fileKey, targetAgent, state, distribution)
 		if job != nil {
 			c.logger.Info("Created reconciliation job",
 				"job_id", job.ID,
@@ -503,7 +505,7 @@ func (c *Controller) selectTargetAgentsForFile(state *ClusterState, distribution
 }
 
 // createJobForFile creates a job for an agent to download a specific file
-func (c *Controller) createJobForFile(fileKey string, targetAgent *types.Agent, state *ClusterState, distribution types.DistributionRequest) *types.Job {
+func (c *Controller) createJobForFile(ctx context.Context, fileKey string, targetAgent *types.Agent, state *ClusterState, distribution types.DistributionRequest) *types.Job {
 	// Parse file key to extract repo, revision, filepath
 	parts := strings.Split(fileKey, "|")
 	if len(parts) != 3 {
@@ -594,7 +596,7 @@ func (c *Controller) createJobForFile(fileKey string, targetAgent *types.Agent, 
 	c.jobMutex.Unlock()
 
 	// Assign job to agent
-	if err := c.scheduler.AssignJobToAgent(job, targetAgent); err != nil {
+	if err := c.scheduler.AssignJobToAgent(ctx, job, targetAgent); err != nil {
 		c.logger.Error("Failed to assign reconciliation job to agent",
 			"job_id", job.ID,
 			"agent_id", targetAgent.ID,
@@ -640,9 +642,12 @@ func (c *Controller) getHealthyAgents() []*types.Agent {
 	c.agentMutex.RLock()
 	defer c.agentMutex.RUnlock()
 
+	// Parse agent timeout from config
+	agentTimeout := types.ParseDuration(c.cfg.AgentTimeout, 5*time.Minute)
+
 	var healthyAgents []*types.Agent
 	for _, agent := range c.agents {
-		if agent.IsHealthy(2 * time.Minute) {
+		if agent.IsHealthy(agentTimeout) {
 			healthyAgents = append(healthyAgents, agent)
 		}
 	}
@@ -655,27 +660,6 @@ type AgentFileAvailability struct {
 	Availability map[string]map[string]bool `json:"availability"` // dataset -> filepath -> available
 }
 
-// queryAllAgentFileAvailability queries file availability from all healthy agents
-func (c *Controller) queryAllAgentFileAvailability(ctx context.Context, agents []*types.Agent) []AgentFileAvailability {
-	var results []AgentFileAvailability
-
-	for _, agent := range agents {
-		availability, err := c.queryAgentFileAvailabilityFull(ctx, agent.ID)
-		if err != nil {
-			c.logger.Debug("Failed to query file availability from agent",
-				"agent_id", agent.ID, "error", err)
-			continue
-		}
-
-		results = append(results, AgentFileAvailability{
-			AgentID:      agent.ID,
-			Availability: availability,
-		})
-	}
-
-	return results
-}
-
 // queryAgentFileAvailabilityFull queries complete file availability from a specific agent
 func (c *Controller) queryAgentFileAvailabilityFull(ctx context.Context, agentID string) (map[string]map[string]bool, error) {
 	agent, exists := c.GetAgent(agentID)
@@ -684,7 +668,7 @@ func (c *Controller) queryAgentFileAvailabilityFull(ctx context.Context, agentID
 	}
 
 	// Make HTTP request to agent's file availability endpoint
-	availabilityURL := fmt.Sprintf("%s/files/availability", agent.AdvertiseAddr.URL())
+	availabilityURL := fmt.Sprintf("%s/files/availability", agent.AdvertiseAddr.String())
 
 	var response struct {
 		Availability map[string]map[string]bool `json:"availability"`
@@ -765,7 +749,7 @@ func (c *Controller) GetAgentCacheStats(ctx context.Context, agentID string) (*c
 	}
 
 	// Make HTTP request to agent's cache stats endpoint
-	cacheStatsURL := fmt.Sprintf("%s/cache/stats", agent.AdvertiseAddr.URL())
+	cacheStatsURL := fmt.Sprintf("%s/cache/stats", agent.AdvertiseAddr.String())
 
 	var stats cache.CacheStats
 	err := c.httpTransfer.Get(ctx, cacheStatsURL, func(resp *http.Response) error {
@@ -800,7 +784,7 @@ func (c *Controller) QueryAgentFileAvailability(ctx context.Context, dataset, fi
 		}
 
 		// Make HTTP request to check file availability
-		fileCheckURL := fmt.Sprintf("%s/datasets/%s/files/%s/info", agent.AdvertiseAddr.URL(), dataset, filePath)
+		fileCheckURL := fmt.Sprintf("%s/datasets/%s/files/%s/info", agent.AdvertiseAddr.String(), dataset, filePath)
 
 		err := c.httpTransfer.Head(ctx, fileCheckURL, func(resp *http.Response) error {
 			defer resp.Body.Close()
@@ -877,23 +861,27 @@ func (c *Controller) GetOptimalAgentsForFile(ctx context.Context, dataset, fileP
 }
 
 // GetCacheStats returns overall cache statistics from the controller's perspective
-func (c *Controller) GetCacheStats() *CacheControllerStats {
+func (c *Controller) GetCacheStats(ctx context.Context) *CacheControllerStats {
 	c.agentMutex.RLock()
 	defer c.agentMutex.RUnlock()
 
 	stats := &CacheControllerStats{
-		TotalAgents:  len(c.agents),
-		CacheEnabled: c.cfg.Cache.Enabled,
+		TotalAgents: len(c.agents),
+		// Controllers don't have cache config - they just track agent cache capabilities
+		CacheEnabled: true, // Always true since we track agent caches
 	}
+
+	// Parse agent timeout from config
+	agentTimeout := types.ParseDuration(c.cfg.AgentTimeout, 5*time.Minute)
 
 	// Count healthy agents with cache capabilities
 	for _, agent := range c.agents {
-		if agent.IsHealthy(2 * time.Minute) {
+		if agent.IsHealthy(agentTimeout) {
 			stats.HealthyAgents++
 
 			// Check if agent has cache enabled by trying to get cache stats
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, err := c.GetAgentCacheStats(ctx, agent.ID)
+			timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			_, err := c.GetAgentCacheStats(timeoutCtx, agent.ID)
 			cancel()
 
 			if err == nil {

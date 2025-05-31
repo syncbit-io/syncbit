@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 
+	"syncbit/internal/core/types"
+
 	"golang.org/x/net/http2"
 )
 
@@ -20,9 +22,8 @@ func DefaultHTTPClient() *http.Client {
 	}
 
 	// Configure HTTP/2 for both HTTP and HTTPS
-	if err := http2.ConfigureTransport(transport); err == nil {
-		// HTTP/2 configured successfully
-	}
+	// Ignoring error as HTTP/2 configuration is best-effort
+	_ = http2.ConfigureTransport(transport)
 
 	return &http.Client{
 		Transport: transport,
@@ -37,13 +38,21 @@ func HTTPWithClient(c *http.Client) HTTPTransferOption {
 	}
 }
 
+func HTTPWithRateLimiter(limiter *types.RateLimiter) HTTPTransferOption {
+	return func(t *HTTPTransfer) {
+		t.limiter = limiter
+	}
+}
+
 type HTTPTransfer struct {
-	client *http.Client
+	client  *http.Client
+	limiter *types.RateLimiter
 }
 
 func DefaultHTTPTransfer() *HTTPTransfer {
 	return &HTTPTransfer{
-		client: DefaultHTTPClient(),
+		client:  DefaultHTTPClient(),
+		limiter: types.DefaultRateLimiter(),
 	}
 }
 
@@ -122,4 +131,9 @@ func (ht *HTTPTransfer) Delete(ctx context.Context, url string, respCb HTTPRespo
 
 func (ht *HTTPTransfer) Head(ctx context.Context, url string, respCb HTTPResponseCallback, reqOpts ...HTTPRequestOption) error {
 	return ht.Do(ctx, http.MethodHead, url, respCb, reqOpts...)
+}
+
+// GetRateLimiter returns the rate limiter for this transfer
+func (ht *HTTPTransfer) GetRateLimiter() *types.RateLimiter {
+	return ht.limiter
 }

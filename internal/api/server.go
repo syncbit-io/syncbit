@@ -4,11 +4,21 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"syncbit/internal/core/logger"
 	"syncbit/internal/core/types"
 )
+
+// mustParseURL is a helper for parsing URLs in default configs
+func mustParseURL(rawURL string) *url.URL {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		panic("invalid default URL: " + rawURL)
+	}
+	return u
+}
 
 type ServerOption func(*Server)
 
@@ -18,7 +28,7 @@ func WithLogger(logger *logger.Logger) ServerOption {
 	}
 }
 
-func WithListen(listen types.Address) ServerOption {
+func WithListen(listen *url.URL) ServerOption {
 	return func(s *Server) {
 		s.listen = listen
 	}
@@ -28,7 +38,7 @@ func WithListen(listen types.Address) ServerOption {
 type Server struct {
 	logger     *logger.Logger
 	httpServer *http.Server
-	listen     types.Address
+	listen     *url.URL
 	routes     map[string]http.HandlerFunc // Map of path+method to handler
 }
 
@@ -36,7 +46,7 @@ type Server struct {
 func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
 		logger: logger.NewLogger(logger.WithName("server")),
-		listen: types.NewAddress("0.0.0.0", 8080),
+		listen: mustParseURL("http://0.0.0.0:8080"),
 		routes: make(map[string]http.HandlerFunc),
 	}
 	for _, opt := range opts {
@@ -44,7 +54,7 @@ func NewServer(opts ...ServerOption) *Server {
 	}
 
 	s.httpServer = &http.Server{
-		Addr:    s.listen.String(),
+		Addr:    s.listen.Host, // This gives us the host:port format needed
 		Handler: http.NewServeMux(),
 	}
 
@@ -66,7 +76,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	// Start server in a goroutine so we can wait for ctx.Done
-	s.logger.Info("Starting server", "address", s.listen.URL())
+	s.logger.Info("Starting server", "address", s.listen.String())
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- s.httpServer.ListenAndServe()

@@ -9,13 +9,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"syncbit/internal/config"
 	"syncbit/internal/core/types"
 )
 
 // Helper function to create a test cache configuration
-func createTestCacheConfig(ramLimit types.Bytes) config.CacheConfig {
-	return config.CacheConfig{
+func createTestCacheConfig(ramLimit types.Bytes) types.CacheConfig {
+	return types.CacheConfig{
 		RAMLimit:  ramLimit,
 		DiskLimit: ramLimit * 2, // Double RAM for disk
 	}
@@ -39,7 +38,15 @@ func createTestCache(ramLimit types.Bytes) (*Cache, func(), error) {
 		return nil, nil, err
 	}
 
-	return cache, cleanup, nil
+	// Enhanced cleanup that properly closes the cache
+	enhancedCleanup := func() {
+		if cache != nil {
+			cache.Close() // Wait for background operations to complete
+		}
+		cleanup()
+	}
+
+	return cache, enhancedCleanup, nil
 }
 
 // Helper function to create test data of specified size
@@ -213,12 +220,12 @@ func (r *testReader) Read(p []byte) (int, error) {
 
 func TestCacheReadThroughWriteThrough(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := config.CacheConfig{
-		RAMLimit:  1024 * 1024,      // 1MB
-		DiskLimit: 10 * 1024 * 1024, // 10MB
+	cacheConfig := types.CacheConfig{
+		RAMLimit:  types.Bytes(64 * 1024 * 1024), // 64MB for testing
+		DiskLimit: types.Bytes(0),                // Unlimited
 	}
 
-	cache, err := NewCache(cfg, tempDir)
+	cache, err := NewCache(cacheConfig, tempDir)
 	require.NoError(t, err)
 
 	dataset := "test-dataset"
@@ -255,7 +262,7 @@ func TestCacheReadThroughWriteThrough(t *testing.T) {
 		// Clear the RAM cache but keep disk files
 		cache.fileCache = make(map[string]*FileEntry)
 		cache.ramUsage = 0
-		cache.lruCache = NewLRUCache(cfg.RAMLimit)
+		cache.lruCache = NewLRUCache(cacheConfig.RAMLimit)
 
 		// File should still be tracked in file index
 		assert.True(t, cache.HasFileByPath(dataset, filepath))
@@ -296,7 +303,7 @@ func TestCacheReadThroughWriteThrough(t *testing.T) {
 		}
 
 		// Create rate limiter (generous for testing)
-		limiter := types.NewRateLimiter(types.Bytes(1024*1024), types.Bytes(1024*1024), 1) // 1MB/s
+		limiter := types.NewRateLimiter(types.Bytes(1024*1024)) // 1MB/s
 
 		// Test write with progress and rate limiting
 		writeRW := cache.NewCacheWriter(dataset, newFilepath, types.Bytes(len(largerData)),
@@ -318,7 +325,7 @@ func TestCacheReadThroughWriteThrough(t *testing.T) {
 		// Clear RAM again
 		cache.fileCache = make(map[string]*FileEntry)
 		cache.ramUsage = 0
-		cache.lruCache = NewLRUCache(cfg.RAMLimit)
+		cache.lruCache = NewLRUCache(cacheConfig.RAMLimit)
 
 		// Test read with rate limiting
 		progressBytes = 0 // Reset counter

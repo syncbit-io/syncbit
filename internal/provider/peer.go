@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 
 	"syncbit/internal/api/request"
-	"syncbit/internal/config"
 	"syncbit/internal/core/types"
 	"syncbit/internal/transport"
 )
@@ -17,14 +17,14 @@ import (
 // It's essentially a simplified HTTP provider for communicating with other agents
 type PeerProvider struct {
 	id           string
-	cfg          *config.ProviderConfig
+	cfg          *types.ProviderConfig
 	token        string
 	headers      map[string]string
 	httpTransfer *transport.HTTPTransfer
 }
 
 // NewPeerProvider creates a new peer provider
-func NewPeerProvider(cfg config.ProviderConfig, transferCfg config.TransferConfig) (Provider, error) {
+func NewPeerProvider(cfg types.ProviderConfig, transferCfg types.TransferConfig) (Provider, error) {
 	// Create HTTP transfer for peer communication
 	httpOpts := []transport.HTTPTransferOption{}
 	if cfg.Token != "" {
@@ -76,16 +76,16 @@ func (p *PeerProvider) GetHeaders() map[string]string {
 }
 
 // GetFileFromPeer retrieves a complete file from a peer agent
-func (p *PeerProvider) GetFileFromPeer(ctx context.Context, peerAddr types.Address, dataset, filepath string) ([]byte, error) {
-	url := fmt.Sprintf("%s/datasets/%s/files/%s", peerAddr.URL(), dataset, filepath)
-	return p.httpGet(ctx, url)
+func (p *PeerProvider) GetFileFromPeer(ctx context.Context, peerAddr *url.URL, dataset, filepath string) ([]byte, error) {
+	fileURL := fmt.Sprintf("%s/datasets/%s/files/%s", peerAddr.String(), dataset, filepath)
+	return p.httpGet(ctx, fileURL)
 }
 
 // GetFileInfoFromPeer retrieves metadata for a file from a peer agent
-func (p *PeerProvider) GetFileInfoFromPeer(ctx context.Context, peerAddr types.Address, dataset, filepath string) (*types.FileInfo, error) {
-	url := fmt.Sprintf("%s/datasets/%s/files/%s/info", peerAddr.URL(), dataset, filepath)
+func (p *PeerProvider) GetFileInfoFromPeer(ctx context.Context, peerAddr *url.URL, dataset, filepath string) (*types.FileInfo, error) {
+	apiURL := fmt.Sprintf("%s/datasets/%s/files/%s/info", peerAddr.String(), dataset, filepath)
 
-	data, err := p.httpGet(ctx, url)
+	data, err := p.httpGet(ctx, apiURL)
 	if err != nil {
 		return nil, err
 	}
@@ -101,8 +101,8 @@ func (p *PeerProvider) GetFileInfoFromPeer(ctx context.Context, peerAddr types.A
 }
 
 // GetFileAvailabilityFromPeer checks if a peer has a complete file
-func (p *PeerProvider) GetFileAvailabilityFromPeer(ctx context.Context, peerAddr types.Address, dataset, filepath string) (bool, error) {
-	url := fmt.Sprintf("%s/datasets/%s/files/%s/info", peerAddr.URL(), dataset, filepath)
+func (p *PeerProvider) GetFileAvailabilityFromPeer(ctx context.Context, peerAddr *url.URL, dataset, filepath string) (bool, error) {
+	url := fmt.Sprintf("%s/datasets/%s/files/%s/info", peerAddr.String(), dataset, filepath)
 
 	var hasFile bool
 	err := p.httpTransfer.Get(ctx, url, func(resp *http.Response) error {
@@ -115,10 +115,10 @@ func (p *PeerProvider) GetFileAvailabilityFromPeer(ctx context.Context, peerAddr
 }
 
 // ListDatasetsFromPeer retrieves list of available datasets from a peer
-func (p *PeerProvider) ListDatasetsFromPeer(ctx context.Context, peerAddr types.Address) ([]string, error) {
-	url := fmt.Sprintf("%s/datasets", peerAddr.URL())
+func (p *PeerProvider) ListDatasetsFromPeer(ctx context.Context, peerAddr *url.URL) ([]string, error) {
+	apiURL := fmt.Sprintf("%s/datasets", peerAddr.String())
 
-	data, err := p.httpGet(ctx, url)
+	data, err := p.httpGet(ctx, apiURL)
 	if err != nil {
 		return nil, err
 	}

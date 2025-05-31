@@ -180,16 +180,16 @@ func (c *Cache) NewReaderWriter(dataset, filepath string, fileSize types.Bytes) 
 }
 
 // Reader returns a reader for the file
-func (rw *ReaderWriter) Reader(ctx interface{}) io.ReadCloser {
+func (rw *ReaderWriter) Reader(ctx any) io.ReadCloser {
 	return rw.cache.NewFileReader(rw.dataset, rw.filepath, rw.fileSize)
 }
 
 // Writer returns a writer for the file
-func (rw *ReaderWriter) Writer(ctx interface{}) io.WriteCloser {
+func (rw *ReaderWriter) Writer(ctx any) io.WriteCloser {
 	return rw.cache.NewFileWriter(rw.dataset, rw.filepath, rw.fileSize)
 }
 
 // WriterAt returns a writer that supports WriteAt for the file
-func (rw *ReaderWriter) WriterAt(ctx interface{}) io.WriterAt {
+func (rw *ReaderWriter) WriterAt(ctx any) io.WriterAt {
 	return rw.cache.NewFileWriter(rw.dataset, rw.filepath, rw.fileSize)
 }

@@ -2,7 +2,6 @@ package cache
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,13 +12,9 @@ import (
 
 // FileStorage manages actual files on disk at their target locations
 type FileStorage interface {
-	// File-level operations (new)
+	// File-level operations
 	WriteFile(dataset, filePath string, data []byte) error
 	ReadFile(dataset, filePath string) ([]byte, error)
-
-	// Block-level operations (legacy, for compatibility)
-	WriteBlockAt(dataset, filePath string, blockIndex int, blockSize types.Bytes, data []byte) error
-	ReadBlockAt(dataset, filePath string, blockIndex int, blockSize types.Bytes) ([]byte, error)
 
 	// Common operations
 	EnsureFile(dataset, filePath string, fileSize types.Bytes) error
@@ -29,6 +24,9 @@ type FileStorage interface {
 
 	// Scanning operations
 	ScanFiles(callback func(dataset, filePath string, fileSize types.Bytes)) error
+	
+	// Disk usage operations
+	GetTotalDiskUsage() (types.Bytes, error)
 }
 
 // DiskFileStorage implements FileStorage for actual files on disk
@@ -73,7 +71,7 @@ func (dfs *DiskFileStorage) WriteFile(dataset, filePath string, data []byte) err
 
 	// Write file atomically by writing to temp file and renaming
 	tempPath := fullPath + ".tmp"
-	if err := ioutil.WriteFile(tempPath, data, 0644); err != nil {
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
@@ -92,7 +90,7 @@ func (dfs *DiskFileStorage) ReadFile(dataset, filePath string) ([]byte, error) {
 
 	fullPath := dfs.getFilePath(dataset, filePath)
 
-	data, err := ioutil.ReadFile(fullPath)
+	data, err := os.ReadFile(fullPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
@@ -123,76 +121,6 @@ func (dfs *DiskFileStorage) EnsureFile(dataset, filePath string, fileSize types.
 	}
 
 	return nil
-}
-
-// WriteBlockAt writes a block at the specified block index within a file
-func (dfs *DiskFileStorage) WriteBlockAt(dataset, filePath string, blockIndex int, blockSize types.Bytes, data []byte) error {
-	fullPath := dfs.getFilePath(dataset, filePath)
-
-	// Calculate offset
-	offset := int64(blockIndex) * int64(blockSize)
-
-	// Open file for writing
-	file, err := os.OpenFile(fullPath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open file %s: %w", fullPath, err)
-	}
-	defer file.Close()
-
-	// Write at offset
-	n, err := file.WriteAt(data, offset)
-	if err != nil {
-		return fmt.Errorf("failed to write at offset %d: %w", offset, err)
-	}
-
-	if n != len(data) {
-		return fmt.Errorf("incomplete write: wrote %d bytes, expected %d", n, len(data))
-	}
-
-	return nil
-}
-
-// ReadBlockAt reads a block at the specified block index within a file
-func (dfs *DiskFileStorage) ReadBlockAt(dataset, filePath string, blockIndex int, blockSize types.Bytes) ([]byte, error) {
-	fullPath := dfs.getFilePath(dataset, filePath)
-
-	// Calculate offset
-	offset := int64(blockIndex) * int64(blockSize)
-
-	// Open file for reading
-	file, err := os.Open(fullPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file %s: %w", fullPath, err)
-	}
-	defer file.Close()
-
-	// Get file size to ensure we don't read beyond EOF
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	// Calculate how much to read
-	fileSize := fileInfo.Size()
-	if offset >= fileSize {
-		return nil, fmt.Errorf("offset %d is beyond file size %d", offset, fileSize)
-	}
-
-	remainingInFile := fileSize - offset
-	bytesToRead := int64(blockSize)
-	if bytesToRead > remainingInFile {
-		bytesToRead = remainingInFile
-	}
-
-	// Read at offset
-	data := make([]byte, bytesToRead)
-	n, err := file.ReadAt(data, offset)
-	if err != nil && err.Error() != "EOF" {
-		return nil, fmt.Errorf("failed to read at offset %d: %w", offset, err)
-	}
-
-	// Return the actual bytes read (may be less than blockSize for the last block)
-	return data[:n], nil
 }
 
 // FileExists checks if a file exists
@@ -261,4 +189,31 @@ func (dfs *DiskFileStorage) ScanFiles(callback func(dataset, filePath string, fi
 	})
 
 	return err
+}
+
+// GetTotalDiskUsage calculates the total disk usage of all files in storage
+func (dfs *DiskFileStorage) GetTotalDiskUsage() (types.Bytes, error) {
+	dfs.mu.RLock()
+	defer dfs.mu.RUnlock()
+
+	var totalSize types.Bytes
+
+	err := filepath.Walk(dfs.basePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// Continue walking even if we can't access a file
+			return nil
+		}
+
+		if !info.IsDir() {
+			totalSize += types.Bytes(info.Size())
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to calculate disk usage: %w", err)
+	}
+
+	return totalSize, nil
 }

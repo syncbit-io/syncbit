@@ -14,7 +14,7 @@ import (
 type JSON map[string]any
 
 // WithJSON creates a request option that sets the request body to JSON
-func WithJSON(data interface{}) transport.HTTPRequestOption {
+func WithJSON(data any) transport.HTTPRequestOption {
 	return func(req *http.Request) {
 		jsonData, err := json.Marshal(data)
 		if err != nil {

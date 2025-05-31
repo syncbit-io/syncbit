@@ -40,8 +40,10 @@ type CLI struct {
 }
 
 func (c *ListCmd) Run(cliRoot *CLI) error {
+	ctx, cancel := types.DefaultSignalNotifySubContext()
+	defer cancel()
 	client := cli.NewClient(cliRoot.ControllerURL)
-	jobs, err := client.ListJobs()
+	jobs, err := client.ListJobs(ctx)
 	if err != nil {
 		return err
 	}
@@ -66,6 +68,8 @@ func (c *ListCmd) Run(cliRoot *CLI) error {
 }
 
 func (c *SubmitJobCmd) Run(cliRoot *CLI) error {
+	ctx, cancel := types.DefaultSignalNotifySubContext()
+	defer cancel()
 	client := cli.NewClient(cliRoot.ControllerURL)
 
 	fmt.Printf("Submitting %d file download jobs with %s distribution...\n", len(c.Files), c.DistStrategy)
@@ -94,7 +98,7 @@ func (c *SubmitJobCmd) Run(cliRoot *CLI) error {
 		// Generate unique job ID
 		jobID := fmt.Sprintf("download-%s-%s-%d-%d", c.Repo, filePath, time.Now().Unix(), i)
 
-		job, err := client.SubmitJob(jobID, config, types.JobHandlerDownload)
+		job, err := client.SubmitJob(ctx, jobID, config, types.JobHandlerDownload)
 		if err != nil {
 			fmt.Printf("Failed to submit job for file %s: %v\n", filePath, err)
 			continue
@@ -109,8 +113,10 @@ func (c *SubmitJobCmd) Run(cliRoot *CLI) error {
 }
 
 func (c *StatusCmd) Run(cliRoot *CLI) error {
+	ctx, cancel := types.DefaultSignalNotifySubContext()
+	defer cancel()
 	client := cli.NewClient(cliRoot.ControllerURL)
-	job, err := client.GetJob(c.JobID)
+	job, err := client.GetJob(ctx, c.JobID)
 	if err != nil {
 		return err
 	}
@@ -124,8 +130,8 @@ func (c *StatusCmd) Run(cliRoot *CLI) error {
 	fmt.Printf("File: %s\n", job.Config.FilePath)
 	fmt.Printf("Local Path: %s\n", job.Config.LocalPath)
 	fmt.Printf("Provider: %s\n", job.Config.ProviderSource.ProviderID)
-	if job.Config.ProviderSource.PeerAddr != (types.Address{}) {
-		fmt.Printf("Peer Address: %s\n", job.Config.ProviderSource.PeerAddr.URL())
+	if job.Config.ProviderSource.PeerAddr != nil {
+		fmt.Printf("Peer Address: %s\n", job.Config.ProviderSource.PeerAddr.String())
 	}
 	fmt.Printf("Distribution Strategy: %s\n", job.Config.Distribution.Strategy)
 	if job.Error != "" {

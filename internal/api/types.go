@@ -4,13 +4,6 @@ import (
 	"net/http"
 )
 
-const (
-	MethodGet    = "GET"
-	MethodHead   = "HEAD"
-	MethodPost   = "POST"
-	MethodPut    = "PUT"
-	MethodDelete = "DELETE"
-)
 
 // Route represents a registered API route
 type Route struct {
