@@ -22,17 +22,6 @@ type LRUEntry struct {
 	size types.Bytes
 }
 
-// LRUStats provides statistics about the LRU cache
-type LRUStats struct {
-	HitRate       float64     `json:"hit_rate"`
-	TotalAccesses int64       `json:"total_accesses"`
-	Hits          int64       `json:"hits"`
-	Misses        int64       `json:"misses"`
-	Evictions     int64       `json:"evictions"`
-	CurrentSize   int         `json:"current_size"`
-	CurrentUsage  types.Bytes `json:"current_usage"`
-	Capacity      types.Bytes `json:"capacity"`
-}
 
 // NewLRUCache creates a new LRU cache with the specified capacity
 func NewLRUCache(capacity types.Bytes) *LRUCache {
@@ -117,23 +106,6 @@ func (c *LRUCache) evictToMakeRoom(neededSize types.Bytes) {
 		c.usage -= entry.size
 		delete(c.items, entry.key)
 		c.evictList.Remove(elem)
-	}
-}
-
-// GetStats returns statistics about the LRU cache
-func (c *LRUCache) GetStats() LRUStats {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return LRUStats{
-		HitRate:       0.0, // Simple LRU doesn't track hit rate
-		TotalAccesses: 0,
-		Hits:          0,
-		Misses:        0,
-		Evictions:     0,
-		CurrentSize:   len(c.items),
-		CurrentUsage:  c.usage,
-		Capacity:      c.capacity,
 	}
 }
 

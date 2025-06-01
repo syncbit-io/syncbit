@@ -104,14 +104,19 @@ type Logger struct {
 // NewLogger creates a new logger instance
 func NewLogger(opts ...LoggerOption) *Logger {
 	l := &Logger{
-		name: "root",
-		opts: DefaultHandlerOptions(),
+		name:  "root",
+		level: defaultLevel,
+		opts:  DefaultHandlerOptions(),
 	}
 	for _, opt := range opts {
 		opt(l)
 	}
 	if l.handler == nil {
-		l.handler = DefaultHandler(l.opts...)
+		// Create handler with the correct level
+		handlerOpts := append(l.opts, func(tintOpts *tint.Options) {
+			tintOpts.Level = slog.Level(l.level)
+		})
+		l.handler = DefaultHandler(handlerOpts...)
 	}
 	l.Logger = slog.New(l.handler).WithGroup(l.name)
 	return l

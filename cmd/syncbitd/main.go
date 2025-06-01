@@ -29,8 +29,11 @@ func (a *AgentCmd) Run() error {
 	ctx, cancel := types.DefaultSignalNotifySubContext()
 	defer cancel()
 
-	ag := agent.NewAgent(a.ConfigFile, a.Debug)
-	return ag.Run(ctx)
+	ag, err := agent.NewAgent(a.ConfigFile, a.Debug)
+	if err != nil {
+		return err
+	}
+	return ag.Start(ctx)
 }
 
 func (c *ControllerCmd) Run() error {
@@ -38,8 +41,11 @@ func (c *ControllerCmd) Run() error {
 	ctx, cancel := types.DefaultSignalNotifySubContext()
 	defer cancel()
 
-	ctrl := controller.NewController(c.ConfigFile, c.Debug)
-	return ctrl.Run(ctx)
+	ctrl, err := controller.NewController(c.ConfigFile, c.Debug)
+	if err != nil {
+		return err
+	}
+	return ctrl.Start(ctx)
 }
 
 func main() {

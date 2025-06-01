@@ -22,6 +22,14 @@ func (b Bytes) MarshalJSON() ([]byte, error) {
 }
 
 func (b *Bytes) UnmarshalJSON(data []byte) error {
+	// Try to unmarshal as a number first
+	var num float64
+	if err := json.Unmarshal(data, &num); err == nil {
+		*b = Bytes(uint64(num))
+		return nil
+	}
+	
+	// If that fails, try as a string
 	var raw string
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err

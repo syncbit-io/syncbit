@@ -236,70 +236,80 @@ test_endpoint "GET" "http://localhost:8082/state" "Agent 2 state"
 test_endpoint "GET" "http://localhost:8081/info" "Agent 1 info"
 test_endpoint "GET" "http://localhost:8082/info" "Agent 2 info"
 
-# Submit a test job
-echo -e "${YELLOW}=== Job Submission Tests ===${NC}"
+# Submit test datasets
+echo -e "${YELLOW}=== Dataset Creation Tests ===${NC}"
 
-job_data='{
-  "id": "test-download-job-1",
-  "handler": "download",
-  "config": {
-    "repo": "microsoft/DialoGPT-medium",
-    "revision": "main",
-    "file_path": "config.json",
-    "local_path": "/tmp/syncbit-test/downloads",
-    "provider_source": {
-      "provider_id": "hf-public"
-    },
-    "distribution": {
-      "strategy": "count",
-      "target_count": 2
-    }
-  }
+dataset_data='{
+  "name": "microsoft/DialoGPT-medium",
+  "revision": "main",
+  "replication": 2,
+  "priority": 10,
+  "sources": [{
+    "id": "hf-public",
+    "type": "hf",
+    "name": "Hugging Face Public",
+    "token": ""
+  }],
+  "files": [{
+    "path": "config.json",
+    "size": "1 KB",
+    "checksum": ""
+  }]
 }'
 
-echo -e "${BLUE}Submitting job with distribution to 2 agents...${NC}"
-test_endpoint "POST" "http://localhost:8080/jobs" "Submit download job with distribution to 2 agents" "$job_data"
+echo -e "${BLUE}Creating dataset with replication count of 2...${NC}"
+test_endpoint "POST" "http://localhost:8080/datasets" "Create DialoGPT dataset with replication 2" "$dataset_data"
 
-# Submit additional test jobs for multiple files
-job_data2='{
-  "id": "test-download-job-2",
-  "handler": "download",
-  "config": {
-    "repo": "microsoft/DialoGPT-medium",
-    "revision": "main",
-    "file_path": "vocab.json",
-    "local_path": "/tmp/syncbit-test/downloads",
-    "provider_source": {
-      "provider_id": "hf-public"
-    },
-    "distribution": {
-      "strategy": "all"
-    }
-  }
+# Create a second dataset
+dataset_data2='{
+  "name": "microsoft/DialoGPT-small",
+  "revision": "main",
+  "replication": 1,
+  "priority": 5,
+  "sources": [{
+    "id": "hf-public",
+    "type": "hf",
+    "name": "Hugging Face Public",
+    "token": ""
+  }],
+  "files": [{
+    "path": "vocab.json",
+    "size": "500 B",
+    "checksum": ""
+  }]
 }'
 
-echo -e "${BLUE}Submitting second job with distribution to all agents...${NC}"
-test_endpoint "POST" "http://localhost:8080/jobs" "Submit second download job with distribution to all agents" "$job_data2"
+echo -e "${BLUE}Creating second dataset with replication count of 1...${NC}"
+test_endpoint "POST" "http://localhost:8080/datasets" "Create DialoGPT-small dataset with replication 1" "$dataset_data2"
 
-# Wait a bit for job processing to begin
-echo -e "${BLUE}Waiting for job processing to begin...${NC}"
+# Wait a bit for dataset processing to begin
+echo -e "${BLUE}Waiting for dataset assignment and processing to begin...${NC}"
 sleep 3
+
+# Test dataset listing
+echo -e "${YELLOW}=== Dataset Management Tests ===${NC}"
+test_endpoint "GET" "http://localhost:8080/datasets" "List all datasets"
+
+# Get specific datasets
+test_endpoint "GET" "http://localhost:8080/datasets/microsoft%2FDialoGPT-medium/main" "Get DialoGPT-medium dataset"
+test_endpoint "GET" "http://localhost:8080/datasets/microsoft%2FDialoGPT-small/main" "Get DialoGPT-small dataset"
 
 # Get initial stats
 echo -e "${YELLOW}=== Initial System Stats ===${NC}"
-test_endpoint "GET" "http://localhost:8080/stats" "Controller overall stats"
-test_endpoint "GET" "http://localhost:8080/jobs/stats" "Controller job stats"
-test_endpoint "GET" "http://localhost:8080/cache/stats" "Controller cache stats"
 test_endpoint "GET" "http://localhost:8081/cache/stats" "Agent 1 cache stats"
 test_endpoint "GET" "http://localhost:8082/cache/stats" "Agent 2 cache stats"
 
-# Monitor job progress
-echo -e "${YELLOW}=== Job Progress Monitoring ===${NC}"
+# Monitor dataset assignment and download progress
+echo -e "${YELLOW}=== Dataset Assignment Monitoring ===${NC}"
 for i in {1..10}; do
     echo -e "${BLUE}=== Progress Check $i/10 ===${NC}"
 
-    # Check job status
-    test_endpoint "GET" "http://localhost:8080/jobs" "List all jobs"
+    # Check dataset list
+    test_endpoint "GET" "http://localhost:8080/datasets" "List all datasets"
+
+    # Check agent assignments
+    test_endpoint "GET" "http://localhost:8080/agents/agent-1/assignments" "Agent 1 assignments"
+    test_endpoint "GET" "http://localhost:8080/agents/agent-2/assignments" "Agent 2 assignments"
 
     # Check agent states
     test_endpoint "GET" "http://localhost:8081/state" "Agent 1 state"
@@ -312,10 +322,6 @@ for i in {1..10}; do
     echo -e "${BLUE}Agent 2 cache stats:${NC}"
     curl -s "http://localhost:8082/cache/stats" | jq . 2>/dev/null || echo "Failed to get stats"
 
-    # Check controller stats
-    echo -e "${BLUE}Controller job stats:${NC}"
-    curl -s "http://localhost:8080/jobs/stats" | jq . 2>/dev/null || echo "Failed to get stats"
-
     sleep 5
 done
 
@@ -323,10 +329,7 @@ done
 echo -e "${YELLOW}=== Final System Analysis ===${NC}"
 
 echo -e "${BLUE}=== Controller Final Stats ===${NC}"
-test_endpoint "GET" "http://localhost:8080/stats" "Controller overall final stats"
-test_endpoint "GET" "http://localhost:8080/jobs/stats" "Controller job final stats"
-test_endpoint "GET" "http://localhost:8080/cache/stats" "Controller cache final stats"
-test_endpoint "GET" "http://localhost:8080/jobs" "Final job list"
+test_endpoint "GET" "http://localhost:8080/datasets" "Final dataset list"
 test_endpoint "GET" "http://localhost:8080/agents" "Final agent list"
 
 echo -e "${BLUE}=== Agent 1 Final Analysis ===${NC}"

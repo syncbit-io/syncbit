@@ -5,319 +5,262 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"time"
+	"strconv"
+	"strings"
 
 	"syncbit/internal/api"
 	"syncbit/internal/api/response"
 	"syncbit/internal/core/types"
 )
 
-// RegisterHandlers registers the handlers for the controller.
 func (c *Controller) RegisterHandlers(registrar api.HandlerRegistrar) error {
-	// Health endpoint
-	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/health", c.handleHealth))
+	routes := []api.Route{
+		api.NewRoute(http.MethodGet, "/health", c.handleHealth),
+		
+		api.NewRoute(http.MethodPost, "/datasets", c.handleCreateDataset),
+		api.NewRoute(http.MethodGet, "/datasets", c.handleListDatasets),
+		api.NewRoute(http.MethodGet, "/datasets/{name}/{revision}", c.handleGetDataset),
+		api.NewRoute(http.MethodDelete, "/datasets/{name}/{revision}", c.handleDeleteDataset),
+		
+		api.NewRoute(http.MethodGet, "/agents", c.handleListAgents),
+		api.NewRoute(http.MethodPost, "/agents/{id}/heartbeat", c.handleAgentHeartbeat),
+		api.NewRoute(http.MethodGet, "/agents/{id}/assignments", c.handleGetAgentAssignments),
+		
+		api.NewRoute(http.MethodGet, "/files/{dataset}/{revision}/{path}/peers", c.handleGetFilePeers),
+		api.NewRoute(http.MethodGet, "/files/{dataset}/{revision}/{path}/blocks/{blockIndex}/peers", c.handleGetBlockPeers),
+	}
 
-	// Stats and metrics endpoints
-	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/stats", c.handleGetStats))
-	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/cache/stats", c.handleGetCacheStats))
-	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/jobs/stats", c.handleGetJobStats))
-
-	// Job management endpoints using Go 1.22+ path parameters
-	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/jobs", c.handleListJobs))
-	registrar.RegisterHandler(api.NewRoute(http.MethodPost, "/jobs", c.handleSubmitJob))
-	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/jobs/{id}", c.handleGetJob))
-
-	// Agent endpoints for job management
-	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/jobs/next", c.handleGetNextJob))
-	registrar.RegisterHandler(api.NewRoute(http.MethodPost, "/jobs/{id}/status", c.handleUpdateJobStatus))
-
-	// Agent registration and state management endpoints
-	registrar.RegisterHandler(api.NewRoute(http.MethodPost, "/agents/register", c.handleRegisterAgent))
-	registrar.RegisterHandler(api.NewRoute(http.MethodPost, "/agents/{id}/heartbeat", c.handleAgentHeartbeat))
-	registrar.RegisterHandler(api.NewRoute(http.MethodGet, "/agents", c.handleListAgents))
-
+	for _, route := range routes {
+		if err := registrar.RegisterHandler(route); err != nil {
+			return err
+		}
+	}
+	
 	return nil
 }
 
-// handleHealth is the handler for the health endpoint.
 func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 	response.Respond(w,
-		response.WithString("OK"),
-	)
+		response.WithJSONStatus(response.JSON{
+			"status":      "healthy",
+			"datasets":    len(c.datasets),
+			"agents":      len(c.agents),
+			"assignments": len(c.assignments),
+		}, http.StatusOK))
 }
 
-// handleSubmitJob handles job submission requests
-func (c *Controller) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
-	var job types.Job
-	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
-		c.logger.Error("Failed to decode job", "error", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+func (c *Controller) handleCreateDataset(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name        string                   `json:"name"`
+		Source      string                   `json:"source,omitempty"`
+		Revision    string                   `json:"revision"`
+		Replication int                      `json:"replication"`
+		Priority    int                      `json:"priority"`
+		Sources     []types.ProviderConfig   `json:"sources"`
+		Files       []types.DatasetFile      `json:"files,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Respond(w, response.WithStringStatus("Invalid request body", http.StatusBadRequest))
 		return
 	}
 
-	// Validate job
-	if job.ID == "" {
-		http.Error(w, "Job ID is required", http.StatusBadRequest)
+	if req.Name == "" || req.Revision == "" {
+		response.Respond(w, response.WithStringStatus("Name and revision are required", http.StatusBadRequest))
 		return
 	}
 
-	if job.Handler != types.JobHandlerDownload {
-		http.Error(w, "Only download handler is supported", http.StatusBadRequest)
+	if strings.Contains(req.Name, "/") {
+		response.Respond(w, response.WithStringStatus("Dataset names cannot contain forward slashes", http.StatusBadRequest))
 		return
 	}
 
-	if job.Config.FilePath == "" {
-		http.Error(w, "File path is required", http.StatusBadRequest)
+	if req.Replication < 1 {
+		req.Replication = 1
+	}
+
+	dataset := types.NewDataset(req.Name, req.Revision, req.Replication)
+	dataset.Source = req.Source
+	dataset.Priority = req.Priority
+	dataset.Sources = req.Sources
+	dataset.Files = req.Files
+
+	if err := c.CreateDataset(dataset); err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			response.Respond(w, response.WithStringStatus(err.Error(), http.StatusConflict))
+		} else {
+			response.Respond(w, response.WithStringStatus(err.Error(), http.StatusInternalServerError))
+		}
 		return
 	}
 
-	if job.Config.ProviderSource.ProviderID == "" {
-		http.Error(w, "Provider source is required", http.StatusBadRequest)
-		return
-	}
-
-	c.logger.Info("Received job submission",
-		"job_id", job.ID,
-		"handler", job.Handler,
-		"file", job.Config.FilePath,
-		"provider", job.Config.ProviderSource.ProviderID,
-	)
-
-	// Submit job to controller
-	if err := c.SubmitJob(r.Context(), &job); err != nil {
-		c.logger.Error("Failed to submit job", "job_id", job.ID, "error", err)
-		http.Error(w, fmt.Sprintf("Failed to submit job: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	response := map[string]any{
-		"message": "Job submitted successfully",
-		"job_id":  job.ID,
-		"status":  string(job.Status),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(response)
+	response.Respond(w, response.WithJSONStatus(response.JSON{"dataset": dataset}, http.StatusCreated))
 }
 
-// handleListJobs returns all jobs
-func (c *Controller) handleListJobs(w http.ResponseWriter, r *http.Request) {
-	jobs := c.ListJobs()
+func (c *Controller) handleListDatasets(w http.ResponseWriter, r *http.Request) {
+	c.datasetsMu.RLock()
+	datasets := make([]*types.Dataset, 0, len(c.datasets))
+	for _, d := range c.datasets {
+		datasets = append(datasets, d)
+	}
+	c.datasetsMu.RUnlock()
 
-	var payload response.JSON = make(response.JSON)
-	payload["jobs"] = jobs
-	payload["count"] = len(jobs)
-
-	response.Respond(w,
-		response.WithJSON(payload),
-	)
+	response.Respond(w, response.WithJSONStatus(response.JSON{"datasets": datasets}, http.StatusOK))
 }
 
-// handleGetJob returns a specific job by ID using path parameter
-func (c *Controller) handleGetJob(w http.ResponseWriter, r *http.Request) {
-	// Use Go 1.22+ path parameter extraction
-	jobID := r.PathValue("id")
-	if jobID == "" {
-		http.Error(w, "Job ID is required", http.StatusBadRequest)
-		return
-	}
+func (c *Controller) handleGetDataset(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	revision := r.PathValue("revision")
 
-	job, exists := c.GetJob(jobID)
-	if !exists {
-		http.Error(w, "Job not found", http.StatusNotFound)
-		return
-	}
-
-	var payload response.JSON = make(response.JSON)
-	payload["job"] = job
-
-	response.Respond(w,
-		response.WithJSON(payload),
-	)
-}
-
-// handleGetNextJob returns the next job for an agent to process
-func (c *Controller) handleGetNextJob(w http.ResponseWriter, r *http.Request) {
-	// Set a timeout for waiting for jobs
-	job, err := c.GetNextJob()
+	dataset, err := c.GetDataset(name, revision)
 	if err != nil {
-		c.logger.Error("Failed to get next job", "error", err)
-		http.Error(w, "Failed to get next job", http.StatusInternalServerError)
+		response.Respond(w, response.WithStringStatus(err.Error(), http.StatusNotFound))
 		return
 	}
 
-	var payload response.JSON = make(response.JSON)
-	payload["job"] = job
-
-	response.Respond(w,
-		response.WithJSON(payload),
-	)
+	response.Respond(w, response.WithJSONStatus(response.JSON{"dataset": dataset}, http.StatusOK))
 }
 
-// handleUpdateJobStatus updates job status from agents using path parameter
-func (c *Controller) handleUpdateJobStatus(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("id")
-	if jobID == "" {
-		http.Error(w, "Job ID is required", http.StatusBadRequest)
+func (c *Controller) handleDeleteDataset(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	revision := r.PathValue("revision")
+
+	if err := c.DeleteDataset(name, revision); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			response.Respond(w, response.WithStringStatus(err.Error(), http.StatusNotFound))
+		} else {
+			response.Respond(w, response.WithStringStatus(err.Error(), http.StatusInternalServerError))
+		}
 		return
 	}
 
-	var statusUpdate struct {
-		Status string `json:"status"`
-		Error  string `json:"error,omitempty"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&statusUpdate); err != nil {
-		c.logger.Error("Failed to decode status update", "error", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	status := types.Status(statusUpdate.Status)
-	if err := c.UpdateJobStatus(jobID, status, statusUpdate.Error); err != nil {
-		c.logger.Error("Failed to update job status", "error", err)
-		http.Error(w, "Failed to update job status", http.StatusInternalServerError)
-		return
-	}
-
-	var payload response.JSON = make(response.JSON)
-	payload["message"] = "Job status updated successfully"
-
-	response.Respond(w,
-		response.WithJSON(payload),
-	)
+	response.Respond(w, response.WithJSONStatus(response.JSON{
+		"message": "Dataset deleted",
+		"dataset": fmt.Sprintf("%s@%s", name, revision),
+	}, http.StatusOK))
 }
 
-// handleRegisterAgent registers a new agent
-func (c *Controller) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
-	var registrationRequest struct {
-		ID            string `json:"id"`
-		AdvertiseAddr string `json:"advertise_addr"`
+func (c *Controller) handleListAgents(w http.ResponseWriter, r *http.Request) {
+	c.agentsMu.RLock()
+	agents := make([]*types.Agent, 0, len(c.agents))
+	for _, a := range c.agents {
+		agents = append(agents, a)
 	}
+	c.agentsMu.RUnlock()
 
-	if err := json.NewDecoder(r.Body).Decode(&registrationRequest); err != nil {
-		c.logger.Error("Failed to decode registration request", "error", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	// Validate required fields
-	if registrationRequest.ID == "" {
-		http.Error(w, "agent ID is required", http.StatusBadRequest)
-		return
-	}
-	if registrationRequest.AdvertiseAddr == "" {
-		http.Error(w, "advertise address is required", http.StatusBadRequest)
-		return
-	}
-
-	// Parse advertise address
-	advertiseAddr, err := url.Parse(registrationRequest.AdvertiseAddr)
-	if err != nil {
-		http.Error(w, "invalid advertise address", http.StatusBadRequest)
-		return
-	}
-
-	agent := &types.Agent{
-		ID:            registrationRequest.ID,
-		AdvertiseAddr: advertiseAddr,
-		State: types.AgentState{
-			DiskUsed:      0,
-			DiskAvailable: 0,
-			ActiveJobs:    []string{},
-			LastUpdated:   time.Now(),
-		},
-	}
-
-	if err := c.RegisterAgent(agent); err != nil {
-		c.logger.Error("Failed to register agent", "error", err)
-		http.Error(w, "Failed to register agent", http.StatusInternalServerError)
-		return
-	}
-
-	var payload response.JSON = make(response.JSON)
-	payload["message"] = "Agent registered successfully"
-	payload["agent_id"] = agent.ID
-
-	response.Respond(w,
-		response.WithJSONStatus(payload, http.StatusCreated),
-	)
+	response.Respond(w, response.WithJSONStatus(response.JSON{"agents": agents}, http.StatusOK))
 }
 
-// handleAgentHeartbeat handles heartbeat from agents
 func (c *Controller) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("id")
-	if agentID == "" {
-		http.Error(w, "Agent ID is required", http.StatusBadRequest)
-		return
-	}
 
 	var state types.AgentState
 	if err := json.NewDecoder(r.Body).Decode(&state); err != nil {
-		c.logger.Error("Failed to decode agent state", "error", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		response.Respond(w, response.WithStringStatus("Invalid request body", http.StatusBadRequest))
 		return
 	}
+
+	c.agentsMu.Lock()
+	agent, exists := c.agents[agentID]
+	if !exists {
+		agent = &types.Agent{
+			ID: agentID,
+		}
+		
+		advertiseAddr := r.Header.Get("X-Advertise-Addr")
+		if advertiseAddr != "" {
+			if parsed, err := url.Parse(advertiseAddr); err == nil {
+				agent.AdvertiseAddr = parsed
+			}
+		}
+		
+		c.agents[agentID] = agent
+	}
+	c.agentsMu.Unlock()
 
 	if err := c.UpdateAgentState(agentID, state); err != nil {
-		c.logger.Error("Failed to update agent state", "error", err)
-		http.Error(w, "Failed to update agent state", http.StatusInternalServerError)
+		response.Respond(w, response.WithStringStatus(err.Error(), http.StatusInternalServerError))
 		return
 	}
 
-	var payload response.JSON = make(response.JSON)
-	payload["message"] = "Heartbeat received"
+	assignments, _ := c.GetAgentAssignments(agentID)
 
-	response.Respond(w,
-		response.WithJSON(payload),
-	)
+	response.Respond(w, response.WithJSONStatus(response.JSON{
+		"agent_id": agentID,
+		"assignments": assignments,
+	}, http.StatusOK))
 }
 
-// handleListAgents returns all registered agents
-func (c *Controller) handleListAgents(w http.ResponseWriter, r *http.Request) {
-	agents := c.ListAgents()
+func (c *Controller) handleGetAgentAssignments(w http.ResponseWriter, r *http.Request) {
+	agentID := r.PathValue("id")
 
-	var payload response.JSON = make(response.JSON)
-	payload["agents"] = agents
-	payload["count"] = len(agents)
+	assignments, err := c.GetAgentAssignments(agentID)
+	if err != nil {
+		response.Respond(w, response.WithStringStatus(err.Error(), http.StatusInternalServerError))
+		return
+	}
 
-	response.Respond(w,
-		response.WithJSON(payload),
-	)
+	response.Respond(w, response.WithJSONStatus(response.JSON{"assignments": assignments}, http.StatusOK))
 }
 
-// handleGetStats returns overall controller statistics
-func (c *Controller) handleGetStats(w http.ResponseWriter, r *http.Request) {
-	jobStats := c.scheduler.GetJobStats()
-	cacheStats := c.GetCacheStats(r.Context())
+func (c *Controller) handleGetFilePeers(w http.ResponseWriter, r *http.Request) {
+	dataset := r.PathValue("dataset")
+	revision := r.PathValue("revision")
+	filePath := r.PathValue("path")
 
-	var payload response.JSON = make(response.JSON)
-	payload["job_stats"] = jobStats
-	payload["cache_stats"] = cacheStats
-	payload["timestamp"] = time.Now()
+	agents, err := c.GetAgentsWithFile(dataset, revision, filePath)
+	if err != nil {
+		response.Respond(w, response.WithStringStatus(err.Error(), http.StatusInternalServerError))
+		return
+	}
 
-	response.Respond(w, response.WithJSON(payload))
+	peers := make([]map[string]any, 0, len(agents))
+	for _, agent := range agents {
+		peers = append(peers, map[string]any{
+			"agent_id": agent.ID,
+			"address": agent.AdvertiseAddr.String(),
+			"last_seen": agent.LastHeartbeat,
+		})
+	}
+
+	response.Respond(w, response.WithJSONStatus(response.JSON{
+		"dataset": fmt.Sprintf("%s@%s", dataset, revision),
+		"file": filePath,
+		"peers": peers,
+	}, http.StatusOK))
 }
 
-// handleGetCacheStats returns cache statistics from controller perspective
-func (c *Controller) handleGetCacheStats(w http.ResponseWriter, r *http.Request) {
-	stats := c.GetCacheStats(r.Context())
+func (c *Controller) handleGetBlockPeers(w http.ResponseWriter, r *http.Request) {
+	dataset := r.PathValue("dataset")
+	revision := r.PathValue("revision")
+	filePath := r.PathValue("path")
+	blockIndexStr := r.PathValue("blockIndex")
+	
+	blockIndex, err := strconv.Atoi(blockIndexStr)
+	if err != nil {
+		response.Respond(w, response.WithStringStatus("Invalid block index", http.StatusBadRequest))
+		return
+	}
 
-	var payload response.JSON = make(response.JSON)
-	payload["cache_stats"] = stats
-	payload["timestamp"] = time.Now()
+	agents, err := c.GetAgentsWithBlock(dataset, revision, filePath, blockIndex)
+	if err != nil {
+		response.Respond(w, response.WithStringStatus(err.Error(), http.StatusInternalServerError))
+		return
+	}
 
-	response.Respond(w, response.WithJSON(payload))
-}
+	peers := make([]map[string]any, 0, len(agents))
+	for _, agent := range agents {
+		peers = append(peers, map[string]any{
+			"agent_id": agent.ID,
+			"address": agent.AdvertiseAddr.String(),
+			"last_seen": agent.LastHeartbeat,
+		})
+	}
 
-// handleGetJobStats returns job scheduler statistics
-func (c *Controller) handleGetJobStats(w http.ResponseWriter, r *http.Request) {
-	stats := c.scheduler.GetJobStats()
-
-	var payload response.JSON = make(response.JSON)
-	payload["job_stats"] = stats
-	payload["timestamp"] = time.Now()
-
-	response.Respond(w, response.WithJSON(payload))
+	response.Respond(w, response.WithJSONStatus(response.JSON{
+		"dataset": fmt.Sprintf("%s@%s", dataset, revision),
+		"file": filePath,
+		"block_index": blockIndex,
+		"peers": peers,
+	}, http.StatusOK))
 }

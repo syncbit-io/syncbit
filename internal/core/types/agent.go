@@ -1,42 +1,95 @@
 package types
 
 import (
+	"fmt"
 	"net/url"
+	"sort"
 	"time"
 )
 
-// AgentState represents the current state reported by an agent
 type AgentState struct {
-	DiskUsed      Bytes     `json:"disk_used"`      // Total disk usage in bytes
-	DiskAvailable Bytes     `json:"disk_available"` // Available disk space in bytes
-	ActiveJobs    []string  `json:"active_jobs"`    // Currently running job IDs
-	LastUpdated   time.Time `json:"last_updated"`   // When this state was last updated
+	DiskUsed        Bytes                    `json:"disk_used"`
+	DiskAvailable   Bytes                    `json:"disk_available"`
+	Assignments     []string                 `json:"assignments"`
+	LocalDatasets   map[string]LocalDataset  `json:"local_datasets"`
+	LastUpdated     time.Time                `json:"last_updated"`
 }
 
-// Agent represents a registered agent
+type LocalDataset struct {
+	Name           string                     `json:"name"`
+	Revision       string                     `json:"revision"`
+	Files          map[string]LocalFileInfo   `json:"files"`
+	TotalSize      Bytes                      `json:"total_size"`
+	IsAssigned     bool                       `json:"is_assigned"`
+	LastAccessed   time.Time                  `json:"last_accessed"`
+}
+
+type LocalFileInfo struct {
+	Path        string    `json:"path"`
+	Size        Bytes     `json:"size"`
+	IsComplete  bool      `json:"is_complete"`
+	Checksum    string    `json:"checksum,omitempty"`
+	LastUpdated time.Time `json:"last_updated"`
+	Blocks      []int     `json:"blocks,omitempty"` // List of block indices this agent has
+}
+
 type Agent struct {
-	ID            string     `json:"id"`             // Unique agent identifier
-	AdvertiseAddr *url.URL   `json:"advertise_addr"` // Address other agents can reach this one at
-	LastHeartbeat time.Time  `json:"last_heartbeat"` // Last time we heard from this agent
-	State         AgentState `json:"state"`          // Current agent state
+	ID            string     `json:"id"`
+	AdvertiseAddr *url.URL   `json:"advertise_addr"`
+	LastHeartbeat time.Time  `json:"last_heartbeat"`
+	State         AgentState `json:"state"`
 }
 
-// IsHealthy returns true if the agent has sent a heartbeat recently
 func (a *Agent) IsHealthy(maxAge time.Duration) bool {
 	return time.Since(a.LastHeartbeat) <= maxAge
 }
 
-// HasCapacity returns true if the agent has sufficient disk space for new jobs
 func (a *Agent) HasCapacity(requiredSpace Bytes) bool {
 	return a.State.DiskAvailable >= requiredSpace
 }
 
-// IsIdle returns true if the agent has no active jobs
-func (a *Agent) IsIdle() bool {
-	return len(a.State.ActiveJobs) == 0
+func (a *Agent) GetAssignmentCount() int {
+	return len(a.State.Assignments)
 }
 
-// GetLoad returns the number of active jobs as a load indicator
-func (a *Agent) GetLoad() int {
-	return len(a.State.ActiveJobs)
+func (a *Agent) HasDataset(name, revision string) bool {
+	key := fmt.Sprintf("%s@%s", name, revision)
+	dataset, exists := a.State.LocalDatasets[key]
+	if !exists {
+		return false
+	}
+	
+	for _, file := range dataset.Files {
+		if !file.IsComplete {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *Agent) HasFile(dataset, revision, filePath string) bool {
+	key := fmt.Sprintf("%s@%s", dataset, revision)
+	datasetInfo, exists := a.State.LocalDatasets[key]
+	if !exists {
+		return false
+	}
+	
+	file, exists := datasetInfo.Files[filePath]
+	return exists && file.IsComplete
+}
+
+func (a *Agent) GetDeletableDatasets(excludeDataset string) []string {
+	var deletable []string
+	for key, dataset := range a.State.LocalDatasets {
+		if !dataset.IsAssigned && key != excludeDataset {
+			deletable = append(deletable, key)
+		}
+	}
+	
+	sort.Slice(deletable, func(i, j int) bool {
+		return a.State.LocalDatasets[deletable[i]].LastAccessed.Before(
+			a.State.LocalDatasets[deletable[j]].LastAccessed)
+	})
+	
+	return deletable
 }

@@ -1,0 +1,8 @@
+- Properly encode dataset names and file names when attempting to look them up from our own controller or agent endpoints to account for valid filesystem characters that aren't valid URL characters
+- Audit internal/core/types/file.go for unnecessary fields/code
+- Replace fmt.Sprintf for file paths with filepath.Join and for URLs with url.JoinPath
+- Run gopls to find deprecated/poor syntax that we can improve and modernize
+- Remove BlockPath codepaths.
+- Fix localDatasets code in agent.go to use the Source field and any other places that require it
+- Find and remove all redundant, unused, or legacy/compatibility code -- particularly the block-level peer stuff
+- Investigate fallback to disk scanning on startup if cache is corrupted

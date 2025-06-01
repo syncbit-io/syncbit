@@ -8,7 +8,7 @@ import (
 
 	"syncbit/internal/core/types"
 
-	"gopkg.in/yaml.v3"
+	"github.com/goccy/go-yaml"
 )
 
 // LoadConfig loads configuration from a YAML file and applies defaults
@@ -96,15 +96,16 @@ func coalesceBytes(loaded, defaultVal types.Bytes) types.Bytes {
 
 // autoDetectAdvertiseAddr derives advertise address from listen address
 func autoDetectAdvertiseAddr(listenAddr *url.URL) *url.URL {
+	if listenAddr == nil {
+		return nil
+	}
 	host := listenAddr.Hostname()
 	port := listenAddr.Port()
 	if host == "0.0.0.0" {
 		host = "localhost"
 	}
-	return &url.URL{
-		Scheme: listenAddr.Scheme,
-		Host:   fmt.Sprintf("%s:%s", host, port),
-	}
+	parsed, _ := url.Parse(fmt.Sprintf("%s://%s:%s", listenAddr.Scheme, host, port))
+	return parsed
 }
 
 // mergeControllerConfig merges loaded config with defaults

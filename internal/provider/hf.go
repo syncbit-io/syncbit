@@ -34,7 +34,7 @@ type HFProvider struct {
 func NewHFProvider(cfg types.ProviderConfig, transferCfg types.TransferConfig) (Provider, error) {
 	// Create HTTP transfer with rate limiting
 	httpOpts := []transport.HTTPTransferOption{}
-	
+
 	// Create rate limiter based on transfer config
 	if transferCfg.RateLimit > 0 {
 		limiter := types.NewRateLimiter(types.Bytes(transferCfg.RateLimit))
@@ -168,9 +168,56 @@ func (p *HFProvider) GetFileInfo(ctx context.Context, repo, revision, path strin
 	return fileInfo, err
 }
 
-// BuildDownloadURL constructs the download URL for a file
-func (p *HFProvider) BuildDownloadURL(repo, revision, path string) string {
-	return fmt.Sprintf("%s/%s/%s/%s/%s", hfBaseURL, repo, hfResolve, revision, path)
+// Download downloads a file from Hugging Face using the provided ReaderWriter
+func (p *HFProvider) Download(ctx context.Context, repo, revision, filePath string, cacheWriter *types.ReaderWriter) error {
+	// Build download URL
+	downloadURL, err := url.JoinPath(hfBaseURL, repo, hfResolve, revision, filePath)
+	if err != nil {
+		return err
+	}
+
+	// Create HTTP client
+	client := &http.Client{}
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	// Add auth header if token is provided
+	if p.token != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", p.token))
+	}
+
+	// Execute request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	// Create a new ReaderWriter that combines the HTTP response with the cache writer
+	// Include rate limiting from transfer config
+	opts := []types.RWOption{
+		types.RWWithIOReader(resp.Body),
+		types.RWWithIOWriter(cacheWriter.WriterAt(ctx)),
+	}
+
+	if p.transferCfg.RateLimit > 0 {
+		limiter := types.NewRateLimiter(types.Bytes(p.transferCfg.RateLimit))
+		opts = append(opts, types.RWWithReadLimiter(limiter))
+	}
+
+	downloadRW := types.NewReaderWriter(opts...)
+
+	// Transfer data from HTTP response through to cache
+	_, err = downloadRW.Transfer(ctx)
+	return err
 }
 
 func init() {

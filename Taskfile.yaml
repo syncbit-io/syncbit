@@ -24,12 +24,20 @@ tasks:
     cmds:
     - go test ./...
 
+  test-working:
+    desc: "Test only working components (agent, cache, core)"
+    cmds:
+    - go test ./internal/agent/... -v
+    - go test ./internal/cache/...
+    - go test ./internal/core/...
+    - go test ./internal/api/...
+    - go test ./internal/transport/...
+
   default:
     desc: "Build syncbit"
     deps: [deps]
     cmds:
     - go build -o ./bin ./cmd/...
-    # - go build -o bin/syncbitd ./cmd/syncbitd
     sources:
     - "**/*.go"
     generates:

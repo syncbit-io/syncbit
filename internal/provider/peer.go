@@ -165,6 +165,50 @@ func (p *PeerProvider) getRequestOptions() []transport.HTTPRequestOption {
 	return nil
 }
 
+// Download downloads a file from a peer using the provided ReaderWriter
+func (p *PeerProvider) Download(ctx context.Context, repo, revision, filePath string, cacheWriter *types.ReaderWriter) error {
+	// For peer provider, repo should be the peer address (e.g., "http://peer:8081")
+	// and filePath is the file path within the dataset
+	fileURL := fmt.Sprintf("%s/datasets/%s/files/%s", repo, url.QueryEscape(filePath), url.QueryEscape(filePath))
+
+	// Create HTTP client
+	client := &http.Client{}
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	// Add default headers
+	for k, v := range p.headers {
+		req.Header.Set(k, v)
+	}
+
+	// Execute request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("peer returned status %d", resp.StatusCode)
+	}
+
+	// Create a new ReaderWriter that combines the peer response with the cache writer
+	opts := []types.RWOption{
+		types.RWWithIOReader(resp.Body),
+		types.RWWithIOWriter(cacheWriter.WriterAt(ctx)),
+	}
+
+	downloadRW := types.NewReaderWriter(opts...)
+
+	// Transfer data from peer response through to cache
+	_, err = downloadRW.Transfer(ctx)
+	return err
+}
+
 func init() {
 	RegisterProviderFactory("peer", NewPeerProvider)
 }

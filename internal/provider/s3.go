@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 
 	"syncbit/internal/core/types"
 	"syncbit/internal/transport"
@@ -99,6 +100,38 @@ func (p *S3Provider) ListFilesInBucket(ctx context.Context, bucket string) ([]st
 // GetFileFromBucket gets metadata for a specific file in the specified bucket
 func (p *S3Provider) GetFileFromBucket(ctx context.Context, bucket, path string) (*types.FileInfo, error) {
 	return p.transfer.GetFile(ctx, bucket, path)
+}
+
+// Download downloads a file from S3 using the provided ReaderWriter
+func (p *S3Provider) Download(ctx context.Context, repo, revision, filePath string, cacheWriter *types.ReaderWriter) error {
+	// For S3 provider, repo should be the bucket name
+	bucket := repo
+
+	// The S3 transport already handles complex multipart downloads
+	// We need to create a temporary ReaderWriter that writes to the cache writer
+	// For now, use a simpler approach similar to HTTP providers
+
+	// Get the object from S3
+	result, err := p.s3Client.GetObjectWithContext(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(filePath),
+	})
+	if err != nil {
+		return fmt.Errorf("get S3 object: %w", err)
+	}
+	defer result.Body.Close()
+
+	// Create a new ReaderWriter that combines the S3 response with the cache writer
+	opts := []types.RWOption{
+		types.RWWithIOReader(result.Body),
+		types.RWWithIOWriter(cacheWriter.WriterAt(ctx)),
+	}
+
+	downloadRW := types.NewReaderWriter(opts...)
+
+	// Transfer data from S3 response through to cache
+	_, err = downloadRW.Transfer(ctx)
+	return err
 }
 
 func init() {

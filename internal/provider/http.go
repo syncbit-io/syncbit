@@ -25,7 +25,7 @@ type HTTPProvider struct {
 func NewHTTPProvider(cfg types.ProviderConfig, transferCfg types.TransferConfig) (Provider, error) {
 	// Create HTTP transfer with rate limiting
 	httpOpts := []transport.HTTPTransferOption{}
-	
+
 	// Create rate limiter based on transfer config
 	if transferCfg.RateLimit > 0 {
 		limiter := types.NewRateLimiter(types.Bytes(transferCfg.RateLimit))
@@ -119,6 +119,49 @@ func (p *HTTPProvider) GetFileFromURL(ctx context.Context, fileURL string) (*typ
 
 	err := p.httpTransfer.Head(ctx, fileURL, callback, reqOpts...)
 	return fileInfo, err
+}
+
+// Download downloads a file from HTTP using the provided ReaderWriter
+func (p *HTTPProvider) Download(ctx context.Context, repo, revision, filePath string, cacheWriter *types.ReaderWriter) error {
+	// For HTTP provider, construct URL from repo (base URL) and filePath
+	fileURL := fmt.Sprintf("%s/%s", repo, filePath)
+
+	// Create HTTP client
+	client := &http.Client{}
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	// Add default headers
+	for k, v := range p.headers {
+		req.Header.Set(k, v)
+	}
+
+	// Execute request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	// Create a new ReaderWriter that combines the HTTP response with the cache writer
+	opts := []types.RWOption{
+		types.RWWithIOReader(resp.Body),
+		types.RWWithIOWriter(cacheWriter.WriterAt(ctx)),
+	}
+
+	downloadRW := types.NewReaderWriter(opts...)
+
+	// Transfer data from HTTP response through to cache
+	_, err = downloadRW.Transfer(ctx)
+	return err
 }
 
 func init() {

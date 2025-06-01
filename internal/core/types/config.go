@@ -37,6 +37,54 @@ type AgentConfig struct {
 	Storage StorageConfig `yaml:"storage"`
 }
 
+// UnmarshalYAML implements custom YAML unmarshaling for AgentConfig
+func (a *AgentConfig) UnmarshalYAML(unmarshal func(any) error) error {
+	// Create a temporary struct with string fields for URL parsing
+	type rawAgentConfig struct {
+		ID                string        `yaml:"id"`
+		ControllerURL     string        `yaml:"controller_url"`
+		ListenAddr        string        `yaml:"listen_addr"`
+		AdvertiseAddr     string        `yaml:"advertise_addr"`
+		HeartbeatInterval string        `yaml:"heartbeat_interval"`
+		Storage           StorageConfig `yaml:"storage"`
+	}
+
+	var raw rawAgentConfig
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+
+	// Parse URL strings
+	if raw.ControllerURL != "" {
+		if parsed, err := url.Parse(raw.ControllerURL); err != nil {
+			return err
+		} else {
+			a.ControllerURL = parsed
+		}
+	}
+	if raw.ListenAddr != "" {
+		if parsed, err := url.Parse(raw.ListenAddr); err != nil {
+			return err
+		} else {
+			a.ListenAddr = parsed
+		}
+	}
+	if raw.AdvertiseAddr != "" {
+		if parsed, err := url.Parse(raw.AdvertiseAddr); err != nil {
+			return err
+		} else {
+			a.AdvertiseAddr = parsed
+		}
+	}
+
+	// Copy other fields
+	a.ID = raw.ID
+	a.HeartbeatInterval = raw.HeartbeatInterval
+	a.Storage = raw.Storage
+
+	return nil
+}
+
 // ControllerConfig holds configuration for controller instances
 type ControllerConfig struct {
 	ListenAddr   *url.URL `yaml:"listen_addr"`   // Address to bind controller API
@@ -63,30 +111,30 @@ type CacheConfig struct {
 
 // ProviderConfig holds authentication and connection configuration for a provider
 type ProviderConfig struct {
-	ID   string `yaml:"id"`   // Unique identifier for this provider instance
-	Type string `yaml:"type"` // Provider type (s3, hf, http, peer)
-	Name string `yaml:"name"` // Human-readable name
+	ID   string `yaml:"id" json:"id"`     // Unique identifier for this provider instance
+	Type string `yaml:"type" json:"type"` // Provider type (s3, hf, http, peer)
+	Name string `yaml:"name" json:"name"` // Human-readable name
 
 	// Authentication settings
-	Token string `yaml:"token"` // Auth token (HF token, API key, etc.)
+	Token string `yaml:"token" json:"token"` // Auth token (HF token, API key, etc.)
 
 	// AWS S3 specific settings
-	Region  string `yaml:"region"`  // AWS region
-	Profile string `yaml:"profile"` // AWS profile
+	Region  string `yaml:"region" json:"region"`   // AWS region
+	Profile string `yaml:"profile" json:"profile"` // AWS profile
 
 	// HTTP specific settings
-	Headers map[string]string `yaml:"headers"` // Default headers for HTTP requests
+	Headers map[string]string `yaml:"headers" json:"headers"` // Default headers for HTTP requests
 
 	// Transfer settings
-	Transfer *TransferConfig `yaml:"transfer,omitempty"` // Per-provider transfer configuration
+	Transfer *TransferConfig `yaml:"transfer,omitempty" json:"transfer,omitempty"` // Per-provider transfer configuration
 }
 
 // TransferConfig holds configuration for transfer settings
 type TransferConfig struct {
-	RateLimit   int64             `yaml:"rate_limit"`  // Bytes per second rate limit
-	PartSize    int64             `yaml:"part_size"`   // Part size for multipart downloads
-	Concurrency int               `yaml:"concurrency"` // Number of concurrent parts
-	Headers     map[string]string `yaml:"headers"`     // HTTP headers
+	RateLimit   int64             `yaml:"rate_limit" json:"rate_limit"`     // Bytes per second rate limit
+	PartSize    int64             `yaml:"part_size" json:"part_size"`       // Part size for multipart downloads
+	Concurrency int               `yaml:"concurrency" json:"concurrency"`   // Number of concurrent parts
+	Headers     map[string]string `yaml:"headers" json:"headers"`           // HTTP headers
 }
 
 // ParseDuration parses a duration string with fallback to default

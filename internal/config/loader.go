@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"gopkg.in/yaml.v3"
+	"github.com/goccy/go-yaml"
 )
 
 // LoadYAML loads a YAML configuration file into the provided config structure.
@@ -60,8 +60,7 @@ func SaveYAML(configFile string, config any) error {
 	}
 	defer f.Close()
 
-	encoder := yaml.NewEncoder(f)
-	encoder.SetIndent(2) // Use 2-space indentation for readability
+	encoder := yaml.NewEncoder(f, yaml.Indent(2))
 
 	if err := encoder.Encode(config); err != nil {
 		return fmt.Errorf("failed to encode YAML config to %s: %w", configFile, err)

@@ -1,20 +1,13 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
-	"time"
 
 	"syncbit/internal/api"
 	"syncbit/internal/api/response"
 	"syncbit/internal/core/types"
-	"syncbit/internal/provider"
-	"syncbit/internal/runner"
-	"syncbit/internal/transport"
 )
 
 const (
@@ -30,9 +23,8 @@ func (a *Agent) RegisterHandlers(registrar api.HandlerRegistrar) error {
 		api.NewRoute(http.MethodGet, "/info", a.handleGetInfo),
 		api.NewRoute(http.MethodGet, "/cache/stats", a.handleGetCacheStats),
 		api.NewRoute(http.MethodGet, "/files/availability", a.handleGetFileAvailability),
-		api.NewRoute(http.MethodPost, "/jobs", a.handleSubmitJob),
-		api.NewRoute(http.MethodGet, "/jobs/{id}", a.handleGetJob),
-		api.NewRoute(http.MethodDelete, "/jobs/{id}", a.handleCancelJob),
+		api.NewRoute(http.MethodGet, "/assignments", a.handleListAssignments),
+		api.NewRoute(http.MethodGet, "/assignments/{id}", a.handleGetAssignment),
 		api.NewRoute(http.MethodGet, "/datasets", a.handleListDatasets),
 		api.NewRoute(http.MethodGet, "/datasets/{name}/files", a.handleListFiles),
 		api.NewRoute(http.MethodGet, "/datasets/{name}/file-content/{path...}", a.handleGetFile),
@@ -57,25 +49,7 @@ func (a *Agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleGetState returns the current agent state
 func (a *Agent) handleGetState(w http.ResponseWriter, r *http.Request) {
-	// Get cache stats for disk usage information
-	cacheStats := a.cache.GetCacheStats()
-
-	// Collect current active jobs
-	a.jobMutex.RLock()
-	activeJobs := make([]string, 0)
-	for jobID, job := range a.jobs {
-		if job.IsActive() {
-			activeJobs = append(activeJobs, jobID)
-		}
-	}
-	a.jobMutex.RUnlock()
-
-	state := types.AgentState{
-		DiskUsed:      types.Bytes(cacheStats.DiskUsage),
-		DiskAvailable: types.Bytes(cacheStats.DiskLimit - cacheStats.DiskUsage),
-		ActiveJobs:    activeJobs,
-		LastUpdated:   time.Now(),
-	}
+	state := a.buildAgentState()
 
 	var payload response.JSON = make(response.JSON)
 	payload["agent_id"] = a.cfg.ID
@@ -97,7 +71,7 @@ func (a *Agent) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 
 // handleGetCacheStats returns cache statistics
 func (a *Agent) handleGetCacheStats(w http.ResponseWriter, r *http.Request) {
-	stats := a.cache.GetCacheStats()
+	stats := a.getCacheStats()
 
 	var payload response.JSON = make(response.JSON)
 	payload["cache_stats"] = stats
@@ -105,320 +79,48 @@ func (a *Agent) handleGetCacheStats(w http.ResponseWriter, r *http.Request) {
 	response.Respond(w, response.WithJSON(payload))
 }
 
-// handleSubmitJob handles job submission from controllers
-func (a *Agent) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
-	var job types.Job
-	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
-		a.log.Error("Failed to decode job", "error", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
+// handleListAssignments returns all current dataset assignments
+func (a *Agent) handleListAssignments(w http.ResponseWriter, r *http.Request) {
+	a.assignmentsMu.RLock()
+	assignments := make([]*types.DatasetAssignment, 0, len(a.assignments))
+	for _, assignment := range a.assignments {
+		assignments = append(assignments, assignment)
 	}
-
-	// Validate job parameters
-	if job.ID == "" {
-		a.log.Error("Job missing required ID")
-		http.Error(w, "Job ID is required", http.StatusBadRequest)
-		return
-	}
-
-	if job.Handler == "" {
-		a.log.Error("Job missing required handler", "job_id", job.ID)
-		http.Error(w, "Job handler is required", http.StatusBadRequest)
-		return
-	}
-
-	if job.Config.FilePath == "" {
-		a.log.Error("Job has no file to download", "job_id", job.ID)
-		http.Error(w, "File path must be specified", http.StatusBadRequest)
-		return
-	}
-
-	if job.Config.ProviderSource.ProviderID == "" {
-		a.log.Error("Job missing provider source", "job_id", job.ID, "handler", job.Handler)
-		http.Error(w, "Job must specify a provider source", http.StatusBadRequest)
-		return
-	}
-
-	a.log.Info("Received job from controller",
-		"job_id", job.ID,
-		"handler", job.Handler,
-		"file", job.Config.FilePath,
-		"provider", job.Config.ProviderSource.ProviderID,
-	)
-
-	// Check if job already exists
-	a.jobMutex.Lock()
-	if existingJob, exists := a.jobs[job.ID]; exists {
-		a.jobMutex.Unlock()
-		a.log.Warn("Job already exists", "job_id", job.ID, "current_status", existingJob.Status)
-
-		var payload response.JSON = make(response.JSON)
-		payload["message"] = "Job already exists"
-		payload["job_id"] = job.ID
-		payload["status"] = string(existingJob.Status)
-
-		response.Respond(w, response.WithJSONStatus(payload, http.StatusConflict))
-		return
-	}
-
-	// Initialize job status
-	job.SetStatus(types.StatusPending, "")
-
-	// Store the job in our jobs map
-	a.jobs[job.ID] = &job
-	a.jobMutex.Unlock()
-
-	// Create a runner job based on the job type and handler
-	var runnerJob *runner.Job
-	switch job.Handler {
-	case types.JobHandlerDownload:
-		runnerJob = a.createDownloadJob(&job)
-	default:
-		// For backward compatibility, treat all job types as download jobs
-		runnerJob = a.createDownloadJob(&job)
-	}
-
-	// Submit job to pool
-	if err := a.pool.Submit(runnerJob); err != nil {
-		a.log.Error("Failed to submit job to pool", "job_id", job.ID, "error", err)
-
-		a.jobMutex.Lock()
-		job.SetStatus(types.StatusFailed, "failed to queue job")
-		a.jobMutex.Unlock()
-
-		http.Error(w, "Failed to queue job", http.StatusInternalServerError)
-		return
-	}
-
-	// Store the job context cancellation function
-	jobCtx, cancelFunc := types.NewCancelableSubContext(a.ctx)
-	a.jobMutex.Lock()
-	a.jobCancelFuncs[job.ID] = cancelFunc
-	job.SetStatus(types.StatusRunning, "")
-	a.jobMutex.Unlock()
-
-	// Start monitoring the job context
-	go func() {
-		<-jobCtx.Done()
-		// Job context was cancelled, clean up
-		a.jobMutex.Lock()
-		delete(a.jobCancelFuncs, job.ID)
-		a.jobMutex.Unlock()
-	}()
-
-	a.log.Info("Job submitted to pool", "job_id", job.ID)
+	a.assignmentsMu.RUnlock()
 
 	var payload response.JSON = make(response.JSON)
-	payload["message"] = "Job accepted"
-	payload["job_id"] = job.ID
-	payload["status"] = string(types.StatusRunning)
+	payload["assignments"] = assignments
+	payload["count"] = len(assignments)
 
-	response.Respond(w, response.WithJSONStatus(payload, http.StatusAccepted))
+	response.Respond(w, response.WithJSON(payload))
 }
 
-// createDownloadJob creates a unified runner job for downloading a single file from a single provider
-func (a *Agent) createDownloadJob(job *types.Job) *runner.Job {
-	return runner.NewJob(job.ID, func(ctx context.Context, rjob *runner.Job) error {
-		a.log.Info("Starting download job",
-			"job_id", job.ID,
-			"file", job.Config.FilePath,
-			"provider", job.Config.ProviderSource.ProviderID,
-		)
-
-		// Validate job config
-		if job.Config.FilePath == "" {
-			return fmt.Errorf("no file path specified")
-		}
-		if job.Config.ProviderSource.ProviderID == "" {
-			return fmt.Errorf("no provider source specified")
-		}
-
-		// Create dataset name from repo/revision for cache
-		datasetName := fmt.Sprintf("%s-%s", job.Config.Repo, job.Config.Revision)
-
-		// Download from the single specified provider
-		err := a.downloadFromProviderSource(ctx, rjob, job, job.Config.ProviderSource, datasetName, job.Config.FilePath)
-		if err != nil {
-			return fmt.Errorf("download failed from provider %s: %w", job.Config.ProviderSource.ProviderID, err)
-		}
-
-		a.log.Info("File downloaded successfully",
-			"job_id", job.ID,
-			"file", job.Config.FilePath,
-			"provider", job.Config.ProviderSource.ProviderID,
-		)
-		return nil
-	})
-}
-
-// downloadFromProviderSource downloads a file from a specific provider source
-func (a *Agent) downloadFromProviderSource(ctx context.Context, rjob *runner.Job, job *types.Job, providerSource types.ProviderSource, datasetName, filePath string) error {
-	// Get the provider
-	prov, err := provider.GetProvider(providerSource.ProviderID)
-	if err != nil {
-		return fmt.Errorf("failed to get provider %s: %w", providerSource.ProviderID, err)
-	}
-
-	// Handle peer providers differently (they need the peer address)
-	if providerSource.ProviderID == "peer-main" && providerSource.PeerAddr != nil {
-		return a.downloadFromPeer(ctx, rjob, prov, providerSource.PeerAddr, datasetName, filePath)
-	}
-
-	// Handle upstream providers (HF, S3, HTTP, etc.)
-	return a.downloadFromUpstreamProvider(ctx, rjob, prov, job, datasetName, filePath)
-}
-
-// downloadFromPeer downloads a file from a peer agent
-func (a *Agent) downloadFromPeer(ctx context.Context, rjob *runner.Job, prov provider.Provider, peerAddr *url.URL, datasetName, filePath string) error {
-	peerProv, ok := prov.(*provider.PeerProvider)
-	if !ok {
-		return fmt.Errorf("provider is not a peer provider")
-	}
-
-	// Check if peer has the file
-	hasFile, err := peerProv.GetFileAvailabilityFromPeer(ctx, peerAddr, datasetName, filePath)
-	if err != nil {
-		return fmt.Errorf("failed to check file availability on peer: %w", err)
-	}
-	if !hasFile {
-		return fmt.Errorf("peer does not have file %s", filePath)
-	}
-
-	// Download the file from peer
-	fileURL := fmt.Sprintf("%s/datasets/%s/files/%s", peerAddr.String(), datasetName, filePath)
-
-	httpTransfer := transport.NewHTTPTransfer(
-		transport.HTTPWithClient(transport.DefaultHTTPClient()),
-	)
-
-	var reqOpts []transport.HTTPRequestOption
-	if headers := peerProv.GetHeaders(); len(headers) > 0 {
-		reqOpts = append(reqOpts, transport.HTTPRequestHeaders(headers))
-	}
-
-	err = httpTransfer.Get(ctx, fileURL, func(resp *http.Response) error {
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("peer returned status %d", resp.StatusCode)
-		}
-
-		return a.storeStreamInCache(ctx, rjob, datasetName, filePath, resp.Body, types.Bytes(resp.ContentLength))
-	}, reqOpts...)
-
-	if err != nil {
-		return fmt.Errorf("failed to download from peer: %w", err)
-	}
-
-	return nil
-}
-
-// downloadFromUpstreamProvider downloads a file from an upstream provider (HF, S3, HTTP, etc.)
-func (a *Agent) downloadFromUpstreamProvider(ctx context.Context, rjob *runner.Job, prov provider.Provider, job *types.Job, datasetName, filePath string) error {
-	// Handle different provider types
-	switch p := prov.(type) {
-	case *provider.HFProvider:
-		return a.downloadFromHFProvider(ctx, rjob, p, job, datasetName, filePath)
-	default:
-		return fmt.Errorf("unsupported provider type for upstream download: %T", prov)
-	}
-}
-
-// handleGetJob returns job status
-func (a *Agent) handleGetJob(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("id")
-	if jobID == "" {
-		http.Error(w, "Job ID is required", http.StatusBadRequest)
+// handleGetAssignment returns a specific dataset assignment by ID
+func (a *Agent) handleGetAssignment(w http.ResponseWriter, r *http.Request) {
+	assignmentID := r.PathValue("id")
+	if assignmentID == "" {
+		http.Error(w, "Assignment ID is required", http.StatusBadRequest)
 		return
 	}
 
-	// Look up job in our jobs map
-	a.jobMutex.RLock()
-	job, exists := a.jobs[jobID]
-	a.jobMutex.RUnlock()
+	a.assignmentsMu.RLock()
+	assignment, exists := a.assignments[assignmentID]
+	a.assignmentsMu.RUnlock()
 
 	if !exists {
-		http.Error(w, "Job not found", http.StatusNotFound)
+		http.Error(w, "Assignment not found", http.StatusNotFound)
 		return
 	}
 
 	var payload response.JSON = make(response.JSON)
-	payload["job_id"] = job.ID
-	payload["status"] = string(job.Status)
-	payload["handler"] = job.Handler
-	if job.Error != "" {
-		payload["error"] = job.Error
-	}
+	payload["assignment"] = assignment
 
-	response.Respond(w,
-		response.WithJSON(payload),
-	)
-}
-
-// handleCancelJob cancels a running job
-func (a *Agent) handleCancelJob(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("id")
-	if jobID == "" {
-		http.Error(w, "Job ID is required", http.StatusBadRequest)
-		return
-	}
-
-	a.jobMutex.Lock()
-	job, exists := a.jobs[jobID]
-	if !exists {
-		a.jobMutex.Unlock()
-		a.log.Warn("Job cancellation requested for non-existent job", "job_id", jobID)
-		http.Error(w, "Job not found", http.StatusNotFound)
-		return
-	}
-
-	// Check if job can be cancelled
-	if job.Status != types.StatusRunning && job.Status != types.StatusPending {
-		a.jobMutex.Unlock()
-		a.log.Warn("Job cancellation requested for non-running job", "job_id", jobID, "status", job.Status)
-
-		var payload response.JSON = make(response.JSON)
-		payload["message"] = "Job cannot be cancelled"
-		payload["job_id"] = jobID
-		payload["status"] = string(job.Status)
-		payload["reason"] = "Job is not running or pending"
-
-		response.Respond(w, response.WithJSONStatus(payload, http.StatusConflict))
-		return
-	}
-
-	// Get the cancel function
-	cancelFunc, hasCancelFunc := a.jobCancelFuncs[jobID]
-
-	// Update job status immediately
-	job.SetStatus(types.StatusCancelled, "Job cancelled by request")
-
-	a.jobMutex.Unlock()
-
-	// Call the cancel function if available
-	if hasCancelFunc {
-		a.log.Info("Cancelling job", "job_id", jobID)
-		cancelFunc()
-	} else {
-		a.log.Warn("Job cancellation requested but no cancel function available", "job_id", jobID)
-	}
-
-	// Report cancellation to controller
-	go a.reportJobStatus(r.Context(), job)
-
-	var payload response.JSON = make(response.JSON)
-	payload["message"] = "Job cancellation initiated"
-	payload["job_id"] = jobID
-	payload["status"] = string(types.StatusCancelled)
-
-	response.Respond(w,
-		response.WithJSON(payload),
-	)
+	response.Respond(w, response.WithJSON(payload))
 }
 
 // handleListDatasets lists available datasets on this agent
 func (a *Agent) handleListDatasets(w http.ResponseWriter, r *http.Request) {
-	datasets := a.cache.ListDatasets()
+	datasets := a.listDatasets()
 
 	datasetList := make([]any, len(datasets))
 	for i, name := range datasets {
@@ -444,13 +146,14 @@ func (a *Agent) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	files := a.cache.ListFiles(datasetName)
+	files := a.listFiles()
 
-	fileList := make([]any, len(files))
-	for i, path := range files {
-		fileList[i] = map[string]any{
+	fileList := make([]any, 0, len(files))
+	for path, fileInfo := range files {
+		fileList = append(fileList, map[string]any{
 			"path": path,
-		}
+			"size": fileInfo.Size,
+		})
 	}
 
 	var payload response.JSON = make(response.JSON)
@@ -473,40 +176,34 @@ func (a *Agent) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.log.Debug("File requested", "dataset", datasetName, "file", filePath)
+	a.logger.Debug("File requested", "dataset", datasetName, "file", filePath)
 
 	// Check if file exists in cache
-	if !a.cache.HasFileByPath(datasetName, filePath) {
+	if !a.hasFileByPath(datasetName, filePath) {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
 
 	// Get file size for the reader
-	data, err := a.cache.GetFileByPath(datasetName, filePath)
+	data, err := a.getFileByPath(datasetName, filePath)
 	if err != nil {
-		a.log.Error("Failed to get file from cache", "error", err)
+		a.logger.Error("Failed to get file from cache", "error", err)
 		http.Error(w, "Failed to read file", http.StatusInternalServerError)
 		return
 	}
 	fileSize := types.Bytes(len(data))
 
-	// Create a cache reader with rate limiting
-	rw := a.cache.NewCacheReader(datasetName, filePath, fileSize)
-	reader := rw.Reader(r.Context())
-	defer func() {
-		if closer, ok := reader.(io.Closer); ok {
-			closer.Close()
-		}
-	}()
+	// For now, just return the data directly
+	// TODO: Implement streaming from block cache reader
 
 	// Serve the file by streaming from cache
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
 	w.WriteHeader(http.StatusOK)
 
-	_, err = io.Copy(w, reader)
+	_, err = w.Write(data)
 	if err != nil {
-		a.log.Error("Failed to stream file to client", "error", err)
+		a.logger.Error("Failed to write file to client", "error", err)
 	}
 }
 
@@ -521,15 +218,15 @@ func (a *Agent) handleGetFileInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if file exists in cache
-	if !a.cache.HasFileByPath(dataset, filePath) {
+	if !a.hasFileByPath(dataset, filePath) {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
 
 	// Get file data to determine size
-	data, err := a.cache.GetFileByPath(dataset, filePath)
+	data, err := a.getFileByPath(dataset, filePath)
 	if err != nil {
-		a.log.Error("Failed to get file from cache", "error", err)
+		a.logger.Error("Failed to get file from cache", "error", err)
 		http.Error(w, "Failed to read file", http.StatusInternalServerError)
 		return
 	}
@@ -547,89 +244,11 @@ func (a *Agent) handleGetFileInfo(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// downloadFromHFProvider delegates HuggingFace download to provider and cache
-func (a *Agent) downloadFromHFProvider(ctx context.Context, rjob *runner.Job, hfProv *provider.HFProvider, job *types.Job, datasetName, filePath string) error {
-	// Check for cancellation before starting
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	// Build download URL (metadata is already used in total calculation)
-	downloadURL := hfProv.BuildDownloadURL(job.Config.Repo, job.Config.Revision, filePath)
-
-	// Create HTTP transport for download
-	httpTransfer := transport.NewHTTPTransfer(
-		transport.HTTPWithClient(transport.DefaultHTTPClient()),
-	)
-
-	// Download directly to cache - let cache handle all file/block operations
-	var reqOpts []transport.HTTPRequestOption
-	if token := hfProv.GetToken(); token != "" {
-		reqOpts = append(reqOpts, transport.HTTPRequestHeaders(map[string]string{
-			"Authorization": fmt.Sprintf("Bearer %s", token),
-		}))
-	}
-
-	err := httpTransfer.Get(ctx, downloadURL, func(resp *http.Response) error {
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("HTTP request failed with status %d", resp.StatusCode)
-		}
-
-		// Delegate to cache system to handle download and storage
-		return a.storeStreamInCache(ctx, rjob, datasetName, filePath, resp.Body, types.Bytes(resp.ContentLength))
-	}, reqOpts...)
-
-	if err != nil {
-		return fmt.Errorf("failed to download file: %w", err)
-	}
-
-	return nil
-}
-
-// storeStreamInCache delegates stream storage to the cache system
-func (a *Agent) storeStreamInCache(ctx context.Context, rjob *runner.Job, datasetName, filePath string, reader io.Reader, fileSize types.Bytes) error {
-	return a.storeStreamInCacheWithMetadata(ctx, rjob, datasetName, filePath, reader, fileSize, nil)
-}
-
-// storeStreamInCacheWithMetadata delegates stream storage to the cache system with optional source metadata
-func (a *Agent) storeStreamInCacheWithMetadata(ctx context.Context, rjob *runner.Job, datasetName, filePath string, reader io.Reader, fileSize types.Bytes, sourceInfo *types.FileInfo) error {
-	// Create a cache-backed writer with progress tracking
-	rw := a.cache.NewCacheWriter(datasetName, filePath, fileSize,
-		types.RWWithIOReader(reader),
-		types.RWWithReaderCallback(func(n int64) {
-			rjob.Tracker().IncCurrent(n)
-		}),
-	)
-
-	// Transfer data from reader to cache writer
-	_, err := rw.Transfer(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to transfer data to cache: %w", err)
-	}
-
-	// Close the writer to ensure write-through to disk
-	if err := rw.CloseWriter(); err != nil {
-		return fmt.Errorf("failed to close cache writer: %w", err)
-	}
-
-	// Update file metadata with source information if available
-	if sourceInfo != nil {
-		if err := a.cache.UpdateFileMetadata(datasetName, filePath, sourceInfo); err != nil {
-			a.log.Warn("Failed to update file metadata", "error", err)
-			// Don't fail the operation, just log the warning
-		}
-	}
-
-	return nil
-}
-
 // handleGetFileAvailability returns information about what files this agent has available
 func (a *Agent) handleGetFileAvailability(w http.ResponseWriter, r *http.Request) {
-	availability := a.cache.GetAgentFileAvailability()
+	// For now, return basic availability info
+	// TODO: Get actual file availability from block cache
+	availability := map[string]any{"available": true}
 
 	var payload response.JSON = make(response.JSON)
 	payload["availability"] = availability

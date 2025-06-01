@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -20,6 +21,12 @@ var (
 type Provider interface {
 	GetName() string
 	GetID() string
+	// Download downloads a file from the provider using the provided ReaderWriter
+	// repo: repository name (e.g., "microsoft/DialoGPT-medium")
+	// revision: revision/branch (e.g., "main")
+	// filePath: path within the repository (e.g., "config.json")
+	// rw: ReaderWriter that handles caching, rate limiting, and progress tracking
+	Download(ctx context.Context, repo, revision, filePath string, rw *types.ReaderWriter) error
 }
 
 // RegisterProviderFactory registers a provider factory function by type
